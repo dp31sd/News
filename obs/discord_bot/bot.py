@@ -171,8 +171,7 @@ def ensure_engine() -> bool:
     print("[*] Motor otomatik derleniyor...")
     try:
         ENGINE_BIN.mkdir(parents=True, exist_ok=True)
-        sep = ";" if sys.platform.startswith("win") else ":"
-        cp = f"{ENGINE_LIB}{sep}*"
+        cp = f"{ENGINE_LIB}/*"
         r = subprocess.run(
             [javac, "-encoding", "UTF-8", "-cp", cp, "-d", str(ENGINE_BIN), str(engine_src)],
             capture_output=True, text=True, timeout=120,
@@ -2592,7 +2591,7 @@ async def _setup_get_or_create_voice(guild: discord.Guild, category, name: str, 
 
 
 def rules_embed() -> discord.Embed:
-    e = discord.Embed(title="📜 Codex Server Rules", color=BRAND_COLOR,
+    e = discord.Embed(title="📜 SuS Finer Server Rules", color=BRAND_COLOR,
                       timestamp=discord.utils.utcnow())
     e.description = (
         "🚫 **No Advertising**\n"
@@ -2606,40 +2605,40 @@ def rules_embed() -> discord.Embed:
         "You must follow [Discord's Terms of Service](https://discord.com/terms) and "
         "[Community Guidelines](https://discord.com/guidelines) at all times."
     )
-    e.set_footer(text="Codex Client • Official Rules")
+    e.set_footer(text="SuS Finer • Official Rules")
     return e
 
 
 def eula_embed() -> discord.Embed:
-    e = discord.Embed(title="End User License Agreement (EULA) — Codex Client", color=INFO_COLOR)
+    e = discord.Embed(title="End User License Agreement (EULA) — SuS Finer", color=INFO_COLOR)
     e.description = (
-        "By downloading, using, or interacting with **Codex Client**, you agree to the following terms. "
-        "If you do not accept these terms, you are not permitted to use Codex Client.\n\n"
-        "**1. License**\nYou are granted a personal, non-transferable, revocable license to use **Codex Client**. "
+        "By downloading, using, or interacting with **SuS Finer**, you agree to the following terms. "
+        "If you do not accept these terms, you are not permitted to use SuS Finer.\n\n"
+        "**1. License**\nYou are granted a personal, non-transferable, revocable license to use **SuS Finer**. "
         "This software is not sold or owned by the user.\n\n"
-        "**2. Ownership**\nAll rights, code, and assets related to Codex Client remain the property of the developers. "
+        "**2. Ownership**\nAll rights, code, and assets related to SuS Finer remain the property of the developers. "
         "You may not claim any part of it as your own.\n\n"
-        "**3. Data Collection**\nBy running Codex Client, you agree that the software may automatically collect "
+        "**3. Data Collection**\nBy running SuS Finer, you agree that the software may automatically collect "
         "and send basic data such as:\n- Date and time of use\n- Your device name\n- HWID / Hardware Identification\n\n"
         "**4. Restrictions**\nYou may not:\n- Modify, reverse-engineer, or decompile the client\n"
         "- Redistribute or **resell** it\n- Use it in any illegal or abusive way\n\n"
-        "**5. Disclaimer**\nCodex Client is provided \"as is.\" No warranties are given regarding safety, stability, "
+        "**5. Disclaimer**\nSuS Finer is provided \"as is.\" No warranties are given regarding safety, stability, "
         "or functionality. Use at your own risk.\n\n"
-        "*By placing Codex Client into your game files, running it, or otherwise using it, you confirm your acceptance "
+        "*By placing SuS Finer into your game files, running it, or otherwise using it, you confirm your acceptance "
         "of all terms outlined in this agreement.*"
     )
     return e
 
 
 def pricing_embed() -> discord.Embed:
-    e = discord.Embed(title="💎 Codex Client Pricing & Information", color=0x5865F2,
+    e = discord.Embed(title="💎 SuS Finer Pricing & Information", color=0x5865F2,
                       timestamp=discord.utils.utcnow())
     e.description = (
-        "**Welcome to Codex Client!**\n\nChoose your subscription plan below:\n\n"
+        "**Welcome to SuS Finer!**\n\nChoose your subscription plan below:\n\n"
         "↳ **Lifetime:** `$12 / 600TRY`\n↳ **Monthly:** `$6 / 300TRY`\n\n"
         "Use our ticket system or purchase channels to get started!"
     )
-    e.set_footer(text="Codex Client • Information")
+    e.set_footer(text="SuS Finer • Information")
     return e
 
 
@@ -2652,7 +2651,7 @@ def ticket_panel_embed() -> discord.Embed:
         "↳ If you didn't get a response from us, we are rather busy or sleeping, be patient.\n"
         "↳ Tickets are purged regularly. If your ticket gets deleted/closed and you still have issues please re-create."
     )
-    e.set_footer(text="Codex Client • Support Team")
+    e.set_footer(text="SuS Finer • Support Team")
     return e
 
 
@@ -2716,10 +2715,10 @@ def bot_faq_embed() -> discord.Embed:
     return e
 
 
-@bot.tree.command(name="setup", description="🛠️ Public sunucu kurulumu: roller, kanallar, sesler, ticket ve bilgi panelleri.")
-@app_commands.describe(temizle="True ise önceki setup kanallarını silip sıfırdan kur (dikkat!)")
+@bot.tree.command(name="setup", description="🛠️ DİKKAT: sunucudaki TÜM kanal ve rolleri silip public sunucuyu sıfırdan kurar.")
+@app_commands.describe(temizle="True = TÜM kanalları + rolleri sil ve sıfırdan kur (varsayılan True). False = sadece eksikleri tamamla.")
 @app_commands.default_permissions(manage_guild=True)
-async def setup_cmd(interaction: discord.Interaction, temizle: bool = False):
+async def setup_cmd(interaction: discord.Interaction, temizle: bool = True):
     if interaction.guild is None:
         return await interaction.response.send_message("❌ Bu komut sadece sunucu içinde kullanılabilir.", ephemeral=True)
     guild = interaction.guild
@@ -2732,41 +2731,68 @@ async def setup_cmd(interaction: discord.Interaction, temizle: bool = False):
     await safe_defer(interaction, thinking=True)
     created, skipped, errors = [], [], []
 
-    async def _maybe_delete_setup():
-        if not temizle:
-            # Client bolumu artik "» Bot" — eski Client kanallarini sessizce tasi/temizle
-            try:
-                legacy = [c for c in guild.text_channels
-                          if c.name in ("ℹ️・client-info", "📄・eula-faq", "👀・sneak-peak", "⛏️・base-finds")]
-                for ch in legacy:
-                    try:
-                        await ch.delete(reason="setup: Client bolumu Bot ile degisti")
-                        await asyncio.sleep(0.3)
-                    except Exception:
-                        pass
-                old_cat = discord.utils.get(guild.categories, name="» Client")
+    async def _migrate_legacy():
+        # temizle=False ise: eski Client / Codex kalintilarini sessizce toparla
+        try:
+            legacy = [c for c in guild.text_channels
+                      if c.name in ("ℹ️・client-info", "📄・eula-faq", "👀・sneak-peak", "⛏️・base-finds")]
+            for ch in legacy:
+                try:
+                    await ch.delete(reason="setup: Client bolumu Bot ile degisti")
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+            for dead_cat in ("» Client", "Codex Chat"):
+                old_cat = discord.utils.get(guild.categories, name=dead_cat)
                 if old_cat is not None and len(old_cat.channels) == 0:
                     try:
-                        await old_cat.delete(reason="setup: Client kategorisi kaldirildi")
+                        await old_cat.delete(reason=f"setup: {dead_cat} kaldirildi")
                     except Exception:
                         pass
-            except Exception:
-                pass
-            return
-        targets = ["rules", "announcements", "giveaways", "update", "client-info", "eula-faq",
-                   "sneak-peak", "base-finds", "reviews", "ticket", "media-info", "media-vids",
-                   "bot-info", "・commands", "・faq",
-                   "chat", "ticket-logs", "mod-log", "welcome", "staff voice", "voice 1", "voice 2",
-                   "ses oluştur", "tickets", "important", "client", "» bot", "media", "codex chat", "voices"]
-        for ch in list(guild.channels):
-            try:
-                if any(t in ch.name.lower() for t in targets):
-                    await ch.delete(reason="setup temizle")
-                    await asyncio.sleep(0.3)
-            except Exception:
-                pass
+        except Exception:
+            pass
 
-    await _maybe_delete_setup()
+    async def _full_wipe():
+        """Sunucudaki TUM kanallari ve silinebilir rolleri kaldirir.
+
+        Dokunulmazlar (Discord API zaten izin vermez):
+        @everyone, bot/entegrasyon rolleri (managed) ve botun rolunden usttekiler.
+        Not: bu komutun calistigi kanal da silinir ama sonuc followup
+        (interaction token) uzerinden gider, o yuzden rapor yine ulasir.
+        """
+        wiped_ch, wiped_rl = 0, 0
+        extra_ch = list(getattr(guild, "forums", []) or []) + list(getattr(guild, "stage_channels", []) or [])
+        for ch in list(guild.text_channels) + list(guild.voice_channels) + extra_ch:
+            try:
+                await ch.delete(reason=f"setup wipe: {interaction.user}")
+                wiped_ch += 1
+                await asyncio.sleep(0.3)
+            except Exception as ex:
+                errors.append(f"silinemedi:#{getattr(ch, 'name', '?')} ({ex})")
+        for cat in list(guild.categories):
+            try:
+                await cat.delete(reason=f"setup wipe: {interaction.user}")
+                wiped_ch += 1
+                await asyncio.sleep(0.3)
+            except Exception as ex:
+                errors.append(f"silinemedi:kat:{cat.name} ({ex})")
+        me_top = me.top_role
+        for r in sorted(guild.roles, key=lambda x: x.position):
+            try:
+                if r.id == guild.id or r.managed or r >= me_top:
+                    continue
+                await r.delete(reason=f"setup wipe: {interaction.user}")
+                wiped_rl += 1
+                await asyncio.sleep(0.3)
+            except Exception as ex:
+                errors.append(f"silinemedi:rol:{r.name} ({ex})")
+        return wiped_ch, wiped_rl
+
+    wiped_ch, wiped_rl = 0, 0
+    if temizle:
+        wiped_ch, wiped_rl = await _full_wipe()
+    else:
+        await _migrate_legacy()
 
     # ── Roller ──
     roles_want = {
@@ -2797,7 +2823,7 @@ async def setup_cmd(interaction: discord.Interaction, temizle: bool = False):
 
     # ── Kategoriler ──
     cats = {}
-    for cname in ["» Important", "» Bot", "» Media", "Codex Chat", "🎫 Tickets", "🔊 Voices"]:
+    for cname in ["» Important", "» Bot", "» Media", "SuS Finer Chat", "🎫 Tickets", "🔊 Voices"]:
         c, is_new = await _setup_get_or_create_category(guild, cname)
         if c is None:
             errors.append(f"kategori:{cname}")
@@ -2820,7 +2846,7 @@ async def setup_cmd(interaction: discord.Interaction, temizle: bool = False):
         ("» Bot", "🎫・ticket", "Destek talebi olustur."),
         ("» Media", "ℹ️・media-info", "Medya kurallari ve bilgi."),
         ("» Media", "🎬・media-vids", "Video ve medya paylasimlari."),
-        ("Codex Chat", "💬・chat", "Genel sohbet."),
+        ("SuS Finer Chat", "💬・chat", "Genel sohbet."),
         ("🎫 Tickets", "📋・ticket-logs", "Ticket transkript kayitlari (sadece yetkili)."),
     ]
     text_ids = {}
@@ -2910,6 +2936,9 @@ async def setup_cmd(interaction: discord.Interaction, temizle: bool = False):
         errors.append(f"ayar-kayit ({ex})")
 
     e = mk_embed("🛠️ Kurulum Tamamlandı", color=SUCCESS_COLOR)
+    if temizle:
+        e.add_field(name="🧹 Wipe", value=f"• Silinen kanal: `{wiped_ch}`\n• Silinen rol: `{wiped_rl}`\n"
+                                          "(@everyone + bot/entegrasyon rolleri korunur)", inline=False)
     e.add_field(name="✅ Oluşturulan", value="\n".join(f"`{c}`" for c in created[:25]) or "*yok (hepsi mevcut)*", inline=True)
     e.add_field(name="⏭️ Zaten vardı", value="\n".join(f"`{c}`" for c in skipped[:25]) or "*yok*", inline=True)
     if errors:

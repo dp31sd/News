@@ -39,9 +39,11 @@ fi
 echo "[+] Motor derlendi."
 
 # 3) Motor smoke-test (ClassNotFound'u bota girmeden yakala)
-if ! java -cp "discord_bot/bin:discord_bot/engine/lib/*" sus.cracker.SusBytecodeEngine >/dev/null 2>&1; then
+# NOT: motor argumansiz cagrilinca kullanim yazip 1 koduyla cikar — bu NORMALDIR (class bulundu, main calisti).
+SMOKE_OUT=$(java -cp "discord_bot/bin:discord_bot/engine/lib/*" sus.cracker.SusBytecodeEngine 2>&1)
+if echo "$SMOKE_OUT" | grep -q "Could not find or load main class\|ClassNotFoundException"; then
     echo "[!] UYARI: motor smoke-test basarisiz, log:"
-    java -cp "discord_bot/bin:discord_bot/engine/lib/*" sus.cracker.SusBytecodeEngine 2>&1 | head -n 10
+    echo "$SMOKE_OUT" | head -n 10
     fail "Motor calismiyor (yukaridaki loga bak)"
 fi
 echo "[+] Motor smoke-test OK."
