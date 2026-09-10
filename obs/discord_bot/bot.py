@@ -2566,7 +2566,7 @@ async def _setup_get_or_create_text(guild: discord.Guild, category, name: str, t
                 guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=False),
                 guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True),
             }
-        ch = await guild.create_text_channel(name, category=category, topic=topic[:100] if topic else None, overwrites=ow)
+        ch = await guild.create_text_channel(name, category=category, topic=topic[:100] if topic else None, overwrites=ow or {})
         await asyncio.sleep(0.4)
         return ch, True
     except (discord.Forbidden, discord.HTTPException):
@@ -2584,7 +2584,7 @@ async def _setup_get_or_create_voice(guild: discord.Guild, category, name: str, 
             if staff_role is not None:
                 ow[staff_role] = discord.PermissionOverwrite(view_channel=True, connect=True)
             ow[guild.me] = discord.PermissionOverwrite(view_channel=True, connect=True, move_members=True)
-        ch = await guild.create_voice_channel(name, category=category, overwrites=ow)
+        ch = await guild.create_voice_channel(name, category=category, overwrites=ow or {})
         await asyncio.sleep(0.4)
         return ch, True
     except (discord.Forbidden, discord.HTTPException):
