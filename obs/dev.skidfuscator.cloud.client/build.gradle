@@ -1,0 +1,48 @@
+import com.github.jengelman.gradle.plugins.shadow.transformers.ServiceFileTransformer
+
+plugins {
+    id 'com.github.johnrengelman.shadow' version '7.1.2'
+    id 'application'
+}
+
+repositories {
+    mavenCentral()
+}
+
+application {
+    mainClass = 'dev.skidfuscator.client.Client'
+}
+
+shadowJar {
+    transform(ServiceFileTransformer) {
+        path = 'META-INF/services'
+        include 'org.eclipse.jetty.http.HttpFieldPreEncoder'
+    }
+}
+
+dependencies {
+    implementation 'org.springframework:spring-messaging:5.3.21'
+    implementation 'org.springframework:spring-websocket:5.3.21'
+    implementation 'javax.websocket:javax.websocket-api:1.1'
+    implementation 'org.beryx:text-io:3.4.1'
+    implementation group: 'org.slf4j', name: 'slf4j-reload4j', version: '2.0.6'
+
+    api 'log4j:log4j:1.2.17'
+    api 'com.fasterxml.jackson.core:jackson-databind:2.13.3'
+    api 'org.eclipse.jetty.aggregate:jetty-all:9.4.46.v20220331'
+    api 'commons-io:commons-io:2.11.0'
+    api 'me.tongfei:progressbar:0.9.3'
+    api 'com.google.guava:guava:31.1-jre'
+    api 'info.picocli:picocli:4.6.3'
+    api 'org.projectlombok:lombok:1.18.24'
+    api 'org.jline:jline:3.21.0'
+
+    api project(':protocol')
+
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.8.1'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.8.1'
+}
+
+test {
+    useJUnitPlatform()
+}

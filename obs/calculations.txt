@@ -1,0 +1,48 @@
+
+Today's date is 2023-03-17
+Performing small int test...5 - 5 = 0
+19 / 3 = 6
+14 + 9 = 23
+19 ^ 4 = 23
+13 - 9 = 4
+9 * 2 = 18
+15 / 18 = 0
+2 % 9 = 2
+
+Performing random math operations...Performing int test 0. Operation name is -
+74 - 957 = -883
+Performing int test 1. Operation name is %
+74 % 74 = 0
+Performing double test 2. Operation name is +
+8.556101546454709 + 5.797782664265068 = 14.353884210719777
+Performing int test 3. Operation name is ^
+74 ^ 892 = 822
+Performing double test 4. Operation name is -
+0.2805255257633217 - 0.2805255257633217 = 0.0
+Performing double test 5. Operation name is +
+9.862795945665074 + 3.535287429360438 = 13.39808337502551
+Performing double test 6. Operation name is *
+3.535287429360438 * 1.1028629585647993 = 3.898937553721397
+Performing int test 7. Operation name is %
+74 % 398 = 74
+Performing int test 8. Operation name is /
+409 / 106 = 3
+Performing double test 9. Operation name is /
+15.846849796405586 / 1.9817656768587806 = 7.996328719106594
+Performing double test 10. Operation name is +
+8.556101546454709 + 10.736554500849767 = 19.292656047304476
+Performing int test 11. Operation name is +
+275 + 398 = 673
+Performing int test 12. Operation name is *
+275 * 355 = 97625
+Performing double test 13. Operation name is *
+8.556101546454709 * 5.932633085882487 = 50.76021112066752
+
+Computing statistics
+Averages for (i, d): 6559.333333333333, 18.283350171090877
+Loaded 4 tests
+Testing annotations
+Test, 0.36, 36
+Testing cryptography (Blowfish)
+Successfully compared strings
+Successfully decrypted hello world 123 1605479835458
