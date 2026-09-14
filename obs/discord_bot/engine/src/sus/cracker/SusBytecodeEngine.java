@@ -8,6 +8,8 @@ import java.util.*;
 import java.util.jar.*;
 import java.util.regex.*;
 import java.util.zip.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
 import org.objectweb.asm.*;
 import org.objectweb.asm.commons.*;
 import org.objectweb.asm.tree.*;
@@ -770,11 +772,15 @@ public class SusBytecodeEngine {
     //  SECTION 2 ─ ADVANCED DEOBFUSCATOR & DEOBFUSCATOR-SRC PIPELINE
     // ══════════════════════════════════════════════════════════════
     private static void runDeobfuscator(File inputJar, File cleanJar, File srcZip, String decompilerPref) throws Exception {
-        System.out.println("[*] [SuS Deobfuscator v4.0] Deobfuscating " + inputJar.getName() + "...");
+        System.out.println("[*] [SuS Deobfuscator v4.5] Deobfuscating " + inputJar.getName() + "...");
         Map<String, byte[]> jar = readJar(inputJar);
-        Map<String, byte[]> cleaned = new LinkedHashMap<>();
+        Map<String, byte[]> cleaned = new ConcurrentHashMap<>();
 
-        int foldCount = 0, deadCount = 0, strCount = 0, remapCount = 0;
+        AtomicInteger foldCount = new AtomicInteger(0);
+        AtomicInteger deadCount = new AtomicInteger(0);
+        AtomicInteger strCount  = new AtomicInteger(0);
+        AtomicInteger cffCount  = new AtomicInteger(0);
+        int remapCount = 0;
 
         // Phase 1: Build safe remapping index with Heuristic Semantic Analysis
         Map<String, String> safeClassRenames = new HashMap<>();
@@ -785,7 +791,8 @@ public class SusBytecodeEngine {
                 String full = n.replace(".class", "");
                 String simple = full.contains("/") ? full.substring(full.lastIndexOf('/') + 1) : full;
                 if (simple.length() <= 3 || simple.startsWith("\u200B") || simple.contains("\u200C") || simple.contains("\uFEFF")
-                        || simple.startsWith("C_") || (simple.startsWith("c") && simple.length() <= 6)) {
+                        || simple.startsWith("C_") || (simple.startsWith("c") && simple.length() <= 6)
+                        || hasNonAscii(simple)) {
                     String pkg = full.contains("/") ? full.substring(0, full.lastIndexOf('/') + 1) : "";
 
                     String baseName = "Class";
@@ -818,13 +825,14 @@ public class SusBytecodeEngine {
         // Apply ASM ClassRemapper if needed across all classes
         SimpleRemapper remapper = !safeClassRenames.isEmpty() ? new SimpleRemapper(safeClassRenames) : null;
 
-        for (Map.Entry<String, byte[]> e : jar.entrySet()) {
+        // Phase 2: Parallel Class Processing & Bytecode Deobfuscation (ForkJoinPool)
+        jar.entrySet().parallelStream().forEach(e -> {
             String name = e.getKey();
             byte[] bytes = e.getValue();
 
             if (!name.endsWith(".class")) {
                 cleaned.put(name, bytes);
-                continue;
+                return;
             }
 
             try {
@@ -841,7 +849,7 @@ public class SusBytecodeEngine {
                 }
 
                 // Restore SourceFile attribute if obfuscated
-                if (cn.sourceFile != null && cn.sourceFile.contains("\u200B")) {
+                if (cn.sourceFile != null && (cn.sourceFile.contains("\u200B") || hasNonAscii(cn.sourceFile))) {
                     String sName = cn.name.contains("/") ? cn.name.substring(cn.name.lastIndexOf('/') + 1) : cn.name;
                     cn.sourceFile = sName + ".java";
                 }
@@ -867,17 +875,17 @@ public class SusBytecodeEngine {
                 }
 
                 for (MethodNode mn : cn.methods) {
-                    // Multi-pass constant folding and dead code elimination (up to 5 passes)
-                    boolean changed = true;
-                    int pass = 0;
-                    while (changed && pass++ < 5) {
-                        changed = false;
+                    if (mn.instructions == null) continue;
+
+                    // Multi-pass constant folding, dead code elimination, string decryption (up to 8 full passes)
+                    for (int pass = 0; pass < 8; pass++) {
+                        boolean changed = false;
                         AbstractInsnNode[] insns = mn.instructions.toArray();
 
                         for (int i = 0; i < insns.length; i++) {
                             AbstractInsnNode insn = insns[i];
 
-                            // ─── Constant Folding ─────────────────────────────
+                            // ─── 1. Constant Folding ─────────────────────────────
                             if (i + 2 < insns.length) {
                                 Integer a = getConstant(insn);
                                 Integer b = getConstant(insns[i + 1]);
@@ -900,67 +908,218 @@ public class SusBytecodeEngine {
                                         mn.instructions.set(insns[i + 2], new LdcInsnNode(result));
                                         mn.instructions.remove(insn);
                                         mn.instructions.remove(insns[i + 1]);
-                                        foldCount++;
+                                        foldCount.incrementAndGet();
                                         changed = true;
                                         break;
                                     }
                                 }
                             }
 
-                            // ─── Dead Opaque Predicate Elimination ────────────
+                            // ─── 2. Dead Opaque Predicate Elimination ────────────
+                            // ICONST_1 + IFNE -> GOTO (always branches)
                             if (insn.getOpcode() == Opcodes.ICONST_1 && i + 1 < insns.length
                                     && insns[i + 1].getOpcode() == Opcodes.IFNE) {
                                 JumpInsnNode jmp = (JumpInsnNode) insns[i + 1];
                                 mn.instructions.set(jmp, new JumpInsnNode(Opcodes.GOTO, jmp.label));
                                 mn.instructions.remove(insn);
-                                deadCount++;
+                                deadCount.incrementAndGet();
                                 changed = true;
                                 break;
                             }
+                            // ICONST_0 + IFNE -> fallthrough (never branches)
                             if (insn.getOpcode() == Opcodes.ICONST_0 && i + 1 < insns.length
                                     && insns[i + 1].getOpcode() == Opcodes.IFNE) {
                                 mn.instructions.remove(insns[i + 1]);
                                 mn.instructions.remove(insn);
-                                deadCount++;
+                                deadCount.incrementAndGet();
                                 changed = true;
                                 break;
                             }
+                            // ICONST_0 + IFEQ -> GOTO (always branches)
+                            if (insn.getOpcode() == Opcodes.ICONST_0 && i + 1 < insns.length
+                                    && insns[i + 1].getOpcode() == Opcodes.IFEQ) {
+                                JumpInsnNode jmp = (JumpInsnNode) insns[i + 1];
+                                mn.instructions.set(jmp, new JumpInsnNode(Opcodes.GOTO, jmp.label));
+                                mn.instructions.remove(insn);
+                                deadCount.incrementAndGet();
+                                changed = true;
+                                break;
+                            }
+                            // ICONST_1 + IFEQ -> fallthrough (never branches)
+                            if (insn.getOpcode() == Opcodes.ICONST_1 && i + 1 < insns.length
+                                    && insns[i + 1].getOpcode() == Opcodes.IFEQ) {
+                                mn.instructions.remove(insns[i + 1]);
+                                mn.instructions.remove(insn);
+                                deadCount.incrementAndGet();
+                                changed = true;
+                                break;
+                            }
+                            // GOTO next instruction -> redundant jump
+                            if (insn.getOpcode() == Opcodes.GOTO && i + 1 < insns.length) {
+                                JumpInsnNode jmp = (JumpInsnNode) insn;
+                                AbstractInsnNode next = insns[i + 1];
+                                if (next == jmp.label || (next instanceof LabelNode && ((LabelNode) next).getLabel() == jmp.label.getLabel())) {
+                                    mn.instructions.remove(insn);
+                                    deadCount.incrementAndGet();
+                                    changed = true;
+                                    break;
+                                }
+                            }
+                            // NOP removal
                             if (insn.getOpcode() == Opcodes.NOP) {
                                 mn.instructions.remove(insn);
-                                deadCount++;
+                                deadCount.incrementAndGet();
+                                changed = true;
+                                break;
+                            }
+                            // SIPUSH/BIPUSH + INEG folding
+                            if (insn.getOpcode() == Opcodes.INEG && i > 0) {
+                                Integer val = getConstant(insns[i - 1]);
+                                if (val != null) {
+                                    mn.instructions.set(insn, new LdcInsnNode(-val));
+                                    mn.instructions.remove(insns[i - 1]);
+                                    foldCount.incrementAndGet();
+                                    changed = true;
+                                    break;
+                                }
+                            }
+                            // DUP + POP -> remove both (identity)
+                            if (insn.getOpcode() == Opcodes.DUP && i + 1 < insns.length
+                                    && insns[i + 1].getOpcode() == Opcodes.POP) {
+                                mn.instructions.remove(insns[i + 1]);
+                                mn.instructions.remove(insn);
+                                deadCount.incrementAndGet();
                                 changed = true;
                                 break;
                             }
 
-                            // ─── Universal Multi-Engine & In-Class Multi-Layer String Decryption ────
+                            // ─── 2.5 Control Flow Flattening & Switch Folding ───
+                            if (insn instanceof TableSwitchInsnNode && i > 0) {
+                                Integer selector = getConstant(insns[i - 1]);
+                                if (selector != null) {
+                                    TableSwitchInsnNode ts = (TableSwitchInsnNode) insn;
+                                    LabelNode target = ts.dflt;
+                                    if (selector >= ts.min && selector <= ts.max) {
+                                        int targetIdx = selector - ts.min;
+                                        if (targetIdx >= 0 && targetIdx < ts.labels.size()) {
+                                            target = ts.labels.get(targetIdx);
+                                        }
+                                    }
+                                    mn.instructions.set(insn, new JumpInsnNode(Opcodes.GOTO, target));
+                                    mn.instructions.remove(insns[i - 1]);
+                                    deadCount.incrementAndGet();
+                                    cffCount.incrementAndGet();
+                                    changed = true;
+                                    break;
+                                }
+                            }
+                            if (insn instanceof LookupSwitchInsnNode && i > 0) {
+                                Integer selector = getConstant(insns[i - 1]);
+                                if (selector != null) {
+                                    LookupSwitchInsnNode ls = (LookupSwitchInsnNode) insn;
+                                    LabelNode target = ls.dflt;
+                                    int idx = ls.keys.indexOf(selector);
+                                    if (idx >= 0 && idx < ls.labels.size()) {
+                                        target = ls.labels.get(idx);
+                                    }
+                                    mn.instructions.set(insn, new JumpInsnNode(Opcodes.GOTO, target));
+                                    mn.instructions.remove(insns[i - 1]);
+                                    deadCount.incrementAndGet();
+                                    cffCount.incrementAndGet();
+                                    changed = true;
+                                    break;
+                                }
+                            }
+                            // Unreachable dead bytecode after unconditional GOTO / RETURN / ATHROW
+                            int curOp = insn.getOpcode();
+                            if ((curOp == Opcodes.GOTO || curOp == Opcodes.ATHROW || (curOp >= Opcodes.IRETURN && curOp <= Opcodes.RETURN))
+                                    && i + 1 < insns.length) {
+                                AbstractInsnNode nextNode = insns[i + 1];
+                                if (!(nextNode instanceof LabelNode) && !(nextNode instanceof FrameNode) && !(nextNode instanceof LineNumberNode)) {
+                                    mn.instructions.remove(nextNode);
+                                    deadCount.incrementAndGet();
+                                    changed = true;
+                                    break;
+                                }
+                            }
+
+                            // ─── 3. String Decryption ────
                             if (insn instanceof LdcInsnNode && i + 1 < insns.length) {
                                 LdcInsnNode ldc = (LdcInsnNode) insn;
                                 AbstractInsnNode next = insns[i + 1];
                                 if (ldc.cst instanceof String && next instanceof MethodInsnNode) {
                                     MethodInsnNode call = (MethodInsnNode) next;
                                     String mName = call.name.toLowerCase();
-                                    if ((decryptMethod != null && call.name.equals(decryptMethod))
+                                    boolean isDecryptCall = (decryptMethod != null && call.name.equals(decryptMethod))
                                             || mName.contains("decrypt") || mName.contains("decode") || mName.contains("_d")
                                             || call.name.contains("0x") || call.name.startsWith("\u200B") || call.name.contains("\u200C")
-                                            || (call.desc.equals("(Ljava/lang/String;)Ljava/lang/String;"))) {
+                                            || (call.desc.equals("(Ljava/lang/String;)Ljava/lang/String;"));
+                                    if (isDecryptCall) {
                                         String dec = null;
                                         if (detectedKey1 != -1 && detectedKey2 != -1) {
-                                            try {
-                                                dec = testMultiLayer(Base64.getDecoder().decode((String) ldc.cst), detectedKey1, detectedKey2);
-                                            } catch (Exception ignored) {}
+                                            try { dec = testMultiLayer(Base64.getDecoder().decode((String) ldc.cst), detectedKey1, detectedKey2); } catch (Exception ignored) {}
                                         }
-                                        if (dec == null) {
-                                            dec = universalDecrypt((String) ldc.cst);
-                                        }
+                                        if (dec == null) dec = universalDecrypt((String) ldc.cst);
                                         if (dec != null) {
                                             mn.instructions.set(ldc, new LdcInsnNode(dec));
                                             mn.instructions.remove(next);
-                                            strCount++;
+                                            strCount.incrementAndGet();
                                             changed = true;
                                             break;
                                         }
                                     }
                                 }
+                            }
+
+                            // ─── 4. InvokeDynamic string concat decryption (Java 9+ makeConcatWithConstants) ────
+                            if (insn instanceof InvokeDynamicInsnNode) {
+                                InvokeDynamicInsnNode indy = (InvokeDynamicInsnNode) insn;
+                                if (indy.name.equals("makeConcatWithConstants") && indy.bsmArgs != null) {
+                                    // Check if preceding LDC constants can be folded into a plain string
+                                    boolean allLdc = true;
+                                    List<String> parts = new ArrayList<>();
+                                    int argCount = org.objectweb.asm.Type.getArgumentTypes(indy.desc).length;
+                                    int startIdx = i - argCount;
+                                    if (startIdx >= 0) {
+                                        for (int ai = startIdx; ai < i; ai++) {
+                                            if (!(insns[ai] instanceof LdcInsnNode) || !(((LdcInsnNode) insns[ai]).cst instanceof String)) {
+                                                allLdc = false; break;
+                                            }
+                                            parts.add((String)((LdcInsnNode) insns[ai]).cst);
+                                        }
+                                        if (allLdc && parts.size() == argCount) {
+                                            // Find template from bsmArgs
+                                            String template = null;
+                                            for (Object arg : indy.bsmArgs) {
+                                                if (arg instanceof String) { template = (String) arg; break; }
+                                            }
+                                            if (template != null) {
+                                                String folded = template;
+                                                for (String part : parts) folded = folded.replaceFirst("\\\u0001", Matcher.quoteReplacement(part));
+                                                if (!folded.contains("\u0001")) {
+                                                    for (int ai = startIdx; ai < i; ai++) mn.instructions.remove(insns[ai]);
+                                                    mn.instructions.set(indy, new LdcInsnNode(folded));
+                                                    strCount.incrementAndGet();
+                                                    changed = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (!changed) break; // full pass completed with no changes
+                    }
+
+                    // Clean bogus try-catch blocks (anti-decompiler traps)
+                    if (mn.tryCatchBlocks != null) {
+                        Iterator<TryCatchBlockNode> it = mn.tryCatchBlocks.iterator();
+                        while (it.hasNext()) {
+                            TryCatchBlockNode tc = it.next();
+                            if (tc.start == tc.end || tc.handler == null || tc.handler == tc.start) {
+                                it.remove();
+                                deadCount.incrementAndGet();
                             }
                         }
                     }
@@ -973,13 +1132,34 @@ public class SusBytecodeEngine {
             } catch (Exception ex) {
                 cleaned.put(name, bytes);
             }
+        });
+
+        // Remap references in metadata JSON files if class renames occurred
+        if (!safeClassRenames.isEmpty()) {
+            for (String metaKey : new String[]{"fabric.mod.json", "quilt.mod.json", "META-INF/mods.toml"}) {
+                byte[] rawMeta = cleaned.get(metaKey);
+                if (rawMeta != null) {
+                    try {
+                        String metaStr = new String(rawMeta, StandardCharsets.UTF_8);
+                        for (Map.Entry<String, String> ren : safeClassRenames.entrySet()) {
+                            String oldSlash = ren.getKey();
+                            String newSlash = ren.getValue();
+                            String oldDot = oldSlash.replace('/', '.');
+                            String newDot = newSlash.replace('/', '.');
+                            metaStr = metaStr.replace(oldSlash, newSlash).replace(oldDot, newDot);
+                        }
+                        cleaned.put(metaKey, metaStr.getBytes(StandardCharsets.UTF_8));
+                    } catch (Exception ignored) {}
+                }
+            }
         }
 
         writeJar(cleanJar, cleaned);
         System.out.println("[+] [SuS Deobfuscator] Bytecode Cleaned!");
-        System.out.println("    Constants Folded   : " + foldCount);
-        System.out.println("    Dead Predicates    : " + deadCount);
-        System.out.println("    Strings Decrypted  : " + strCount);
+        System.out.println("    Constants Folded   : " + foldCount.get());
+        System.out.println("    Dead Predicates    : " + deadCount.get());
+        System.out.println("    Strings Decrypted  : " + strCount.get());
+        System.out.println("    CFF Switch Unfolds : " + cffCount.get());
         System.out.println("    Members Remapped   : " + remapCount);
         System.out.println("    Clean JAR Output   : " + cleanJar.getAbsolutePath());
 
@@ -987,6 +1167,7 @@ public class SusBytecodeEngine {
         System.out.println("[*] [SuS DeobfuscatorSrc] Starting decompilation pipeline (Preferences: " + decompilerPref + ")...");
         File baseTemp = new File("discord_bot/temp");
         if (!baseTemp.exists()) baseTemp = new File("temp");
+        baseTemp.mkdirs();
         File tempDir = new File(baseTemp, "deob_src_" + System.currentTimeMillis());
         tempDir.mkdirs();
         try {
@@ -997,7 +1178,7 @@ public class SusBytecodeEngine {
                 decompileSuccess = runDecompiler("vineflower", cleanJar, tempDir);
                 engineUsed = "Vineflower (Primary)";
                 if (!decompileSuccess) {
-                    System.out.println("    Vineflower failed, falling back to CFR...");
+                    System.out.println("    Vineflower failed or timed out, falling back to CFR...");
                     decompileSuccess = runDecompiler("cfr", cleanJar, tempDir);
                     engineUsed = "CFR (Fallback)";
                 }
@@ -1006,7 +1187,7 @@ public class SusBytecodeEngine {
                 decompileSuccess = runDecompiler("cfr", cleanJar, tempDir);
                 engineUsed = "CFR (Primary)";
                 if (!decompileSuccess) {
-                    System.out.println("    CFR failed, falling back to Vineflower...");
+                    System.out.println("    CFR failed or timed out, falling back to Vineflower...");
                     decompileSuccess = runDecompiler("vineflower", cleanJar, tempDir);
                     engineUsed = "Vineflower (Fallback)";
                 }
@@ -1038,13 +1219,15 @@ public class SusBytecodeEngine {
                 pw.println("Output Source ZIP: `" + srcZip.getName() + "`");
                 pw.println("\n## Bytecode Deobfuscation Summary");
                 pw.println("- **Decompiler Engine Used**: " + engineUsed);
+                pw.println("- **Decompilation Status**: " + (decompileSuccess ? "SUCCESS" : "PARTIAL / FALLBACK"));
                 pw.println("- **Java Source Files (.java)**: " + javaFileCount);
                 pw.println("- **Asset/Config Files Preserved**: " + assetCount);
-                pw.println("- **Constants Folded**: " + foldCount);
-                pw.println("- **Dead Opaque Predicates Pruned**: " + deadCount);
-                pw.println("- **Encrypted Strings Decrypted**: " + strCount);
+                pw.println("- **Constants Folded**: " + foldCount.get());
+                pw.println("- **Dead Opaque Predicates Pruned**: " + deadCount.get());
+                pw.println("- **Encrypted Strings Decrypted**: " + strCount.get());
+                pw.println("- **Flattened Switch Blocks Unfolded**: " + cffCount.get());
                 pw.println("- **Classes/Members Safely Remapped**: " + remapCount);
-                pw.println("\n---\n*Generated by SuS Cracker Suite v4.0*");
+                pw.println("\n---\n*Generated by SuS Cracker Suite v4.5*");
             }
 
             zipDirectory(tempDir, srcZip);
@@ -1071,20 +1254,26 @@ public class SusBytecodeEngine {
         }
         if (decompJar == null) return false;
         try {
+            int cpuThreads = Math.max(2, Math.min(16, Runtime.getRuntime().availableProcessors()));
             ProcessBuilder pb;
             if (engine.equals("vineflower")) {
-                pb = new ProcessBuilder("java", "-jar", decompJar.getAbsolutePath(),
+                pb = new ProcessBuilder("java",
+                    "-Xmx2G", "-XX:+UseG1GC", "-XX:MaxGCPauseMillis=200",
+                    "-jar", decompJar.getAbsolutePath(),
                     "--rename-members=1",
                     "--simplify-stack=1",
                     "--remove-synthetic=1",
                     "--remove-bridge=1",
                     "--synthetic-not-set=1",
                     "--try-loop-fix=1",
-                    "--thread-count=4",
+                    "--thread-count=" + cpuThreads,
                     "--log-level=warn",
                     jar.getAbsolutePath(), outDir.getAbsolutePath());
             } else {
-                pb = new ProcessBuilder("java", "-jar", decompJar.getAbsolutePath(),
+                // CFR — fast, anti-obf flags enabled; disable heavy features for speed
+                pb = new ProcessBuilder("java",
+                    "-Xmx2G", "-XX:+UseG1GC", "-XX:MaxGCPauseMillis=200",
+                    "-jar", decompJar.getAbsolutePath(),
                     jar.getAbsolutePath(),
                     "--outputdir", outDir.getAbsolutePath(),
                     "--antiobf", "true",
@@ -1098,16 +1287,23 @@ public class SusBytecodeEngine {
                     "--hideutf", "false",
                     "--comments", "false",
                     "--showversion", "false",
-                    "--silent", "true");
+                    "--silent", "true",
+                    "--threads", String.valueOf(cpuThreads));
             }
+            // CRITICAL FIX: Discard process output to prevent OS pipe buffer deadlocks!
+            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+            pb.redirectError(ProcessBuilder.Redirect.DISCARD);
             Process p = pb.start();
-            boolean finished = p.waitFor(90, java.util.concurrent.TimeUnit.SECONDS);
+            // Increased timeout: 120s per engine to handle large/complex JARs
+            boolean finished = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
             if (!finished) {
                 p.destroyForcibly();
+                System.out.println("    [!] " + engine + " timed out after 120s — switching to fallback.");
                 return false;
             }
             return p.exitValue() == 0;
         } catch (Exception e) {
+            System.out.println("    [!] " + engine + " launch error: " + e.getMessage());
             return false;
         }
     }
@@ -1123,37 +1319,76 @@ public class SusBytecodeEngine {
         return count;
     }
 
+    private static boolean hasNonAscii(String s) {
+        if (s == null) return false;
+        for (char c : s.toCharArray()) {
+            if (c > 127 || c < 32) return true;
+        }
+        return false;
+    }
+
     private static String universalDecrypt(String val) {
         if (val == null || val.isEmpty()) return null;
-        try {
-            byte[] dec = Base64.getDecoder().decode(val);
+        byte[] dec = null;
+        try { dec = Base64.getDecoder().decode(val.replaceAll("\\s+", "")); } catch (Exception ignored) {}
 
-            // 1. Try SuS Default Key (0x5A)
-            String s = testXor(dec, 0x5A);
-            if (isPrintable(s)) return s;
+        if (dec != null) {
+            // 1. SuS multi-layer XOR (key1 ^ (i*31+7)) & 0xFF) ^ (key2 + i)
+            for (int k1 = 0x5A; k1 < 0x100; k1 += (k1 == 0x5A ? 0xA5 : 1)) {
+                for (int k2 = 0x3C; k2 < 0x100; k2 += (k2 == 0x3C ? 0xC3 : 1)) {
+                    String s = testMultiLayer(dec, k1, k2);
+                    if (s != null && isStrictlyPrintable(s)) return s;
+                }
+            }
 
-            // 2. Try Allatori Default Key (0xFF)
-            s = testXor(dec, 0xFF);
-            if (isPrintable(s)) return s;
-
-            // 3. Brute force single-byte XOR
-            for (int k = 1; k < 255; k++) {
-                if (k == 0x5A || k == 0xFF) continue;
+            // 2. Single-byte XOR (Allatori, Obfuscator-LLVM, DashO, Zelix)
+            String s = testXor(dec, 0x5A);  if (isPrintable(s)) return s;
+            s = testXor(dec, 0xFF);          if (isPrintable(s)) return s;
+            s = testXor(dec, 0x42);          if (isPrintable(s)) return s; // Zelix KlassMaster default
+            s = testXor(dec, 0x69);          if (isPrintable(s)) return s; // Bozobfuscator default
+            s = testXor(dec, 0xAB);          if (isPrintable(s)) return s; // SkidSuite variant
+            for (int k = 1; k < 256; k++) {
+                if (k == 0x5A || k == 0xFF || k == 0x42 || k == 0x69 || k == 0xAB) continue;
                 s = testXor(dec, k);
                 if (isStrictlyPrintable(s)) return s;
             }
 
-            // 4. Raw UTF-8 check
+            // 3. Rolling XOR: key[i] = key ^ (i & 0xFF)
+            for (int baseKey = 1; baseKey < 256; baseKey++) {
+                byte[] out = new byte[dec.length];
+                for (int i = 0; i < dec.length; i++) out[i] = (byte)(dec[i] ^ (baseKey ^ (i & 0xFF)));
+                s = new String(out, StandardCharsets.UTF_8);
+                if (isStrictlyPrintable(s)) return s;
+            }
+
+            // 4. Zelix KlassMaster: encrypted = byte ^ (key + (i % modulus))
+            for (int modulus : new int[]{7, 13, 17, 31}) {
+                for (int k = 1; k < 256; k++) {
+                    byte[] out = new byte[dec.length];
+                    for (int i = 0; i < dec.length; i++) out[i] = (byte)(dec[i] ^ (k + (i % modulus)));
+                    s = new String(out, StandardCharsets.UTF_8);
+                    if (isStrictlyPrintable(s)) return s;
+                }
+            }
+
+            // 5. Raw UTF-8 check
             s = new String(dec, StandardCharsets.UTF_8);
             if (isPrintable(s)) return s;
-        } catch (Exception ignored) {}
+        }
 
-        // Brute force directly on string chars
+        // 6. Direct char-level XOR (non-Base64 encrypted strings)
         try {
             char[] chars = val.toCharArray();
             for (int k = 1; k < 128; k++) {
                 char[] copy = new char[chars.length];
                 for (int i = 0; i < chars.length; i++) copy[i] = (char)(chars[i] ^ k);
+                String s = new String(copy);
+                if (isStrictlyPrintable(s)) return s;
+            }
+            // Rolling char XOR
+            for (int k = 1; k < 128; k++) {
+                char[] copy = new char[chars.length];
+                for (int i = 0; i < chars.length; i++) copy[i] = (char)(chars[i] ^ (k + i));
                 String s = new String(copy);
                 if (isStrictlyPrintable(s)) return s;
             }
@@ -1200,15 +1435,17 @@ public class SusBytecodeEngine {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  SECTION 3 ─ SCANNER & CLEANER ENGINES
+    //  SECTION 3 ─ SCANNER & CLEANER ENGINES (SILENTNET & INJECTED RAT SPECIALIST)
     // ══════════════════════════════════════════════════════════════
-    // ── SilentNet / github-payload imza yardımcıları ──
 
-    /** Tek bir string sabitini tarar: bulgu ekler, risk puanını döndürür.
-      *  Ldc ve invokedynamic-bootstrap sabitlerinin ikisine de uygulanır. */
+    /** Tek bir string sabitini tarar: bulgu ekler, risk puanını döndürür. */
     private static int scanConstantString(String s, String className, List<String> findings) {
         int d = 0;
         String v = s.toLowerCase();
+        if (v.contains("silentnet.set") || (v.contains("silentnet") && v.contains(".set"))) {
+            findings.add("[CRITICAL] SilentNet encrypted payload reference in " + className + ": " + s);
+            d += 85; return d;
+        }
         if (v.contains("discord.com/api/webhooks") || v.contains("/api/webhooks")) {
             findings.add("[CRITICAL] Discord Webhook URL in " + className); d += 50; return d;
         }
@@ -1218,18 +1455,23 @@ public class SusBytecodeEngine {
         String dec = tryBase64Decode(s);
         if (dec != null) {
             String dl = dec.toLowerCase();
-            if (dl.contains("discord.com/api/webhooks") || dl.contains("discordapp.com/api/webhooks") || dl.contains("/api/webhooks")) {
+            if (dl.contains("silentnet")) {
+                findings.add("[CRITICAL] Base64-obfuscated SilentNet reference in " + className); d += 85;
+            } else if (dl.contains("discord.com/api/webhooks") || dl.contains("discordapp.com/api/webhooks") || dl.contains("/api/webhooks")) {
                 findings.add("[CRITICAL] Base64-obfuscated Webhook in " + className); d += 50;
             } else if (dl.contains("api.telegram.org")) {
                 findings.add("[CRITICAL] Base64-obfuscated Telegram exfil in " + className); d += 50;
             }
             return d;
         }
-        if (v.contains("api.ipify.org") || v.contains("icanhazip.com")) {
+        if (v.contains("api.ipify.org") || v.contains("icanhazip.com") || v.contains("checkip.amazonaws.com")) {
             findings.add("[HIGH] IP Grabber endpoint in " + className); d += 30;
         }
-        if (v.contains("password") || v.contains("launcher_accounts")) {
-            findings.add("[CRITICAL] Token/Account stealer pattern in " + className); d += 50;
+        if (v.contains("launcher_accounts.json") || (v.contains("usercache.json") && v.contains("minecraft"))) {
+            findings.add("[CRITICAL] Minecraft Session Token Stealer target in " + className); d += 60;
+        }
+        if (v.contains("login data") || v.contains("cookies.sqlite") || (v.contains("local storage") && v.contains("leveldb"))) {
+            findings.add("[CRITICAL] Browser/Discord Credential Stealer pattern in " + className); d += 50;
         }
         if (v.contains("keyauth.win") || v.contains("keyauth.xyz")) {
             findings.add("[HIGH] KeyAuth license endpoint in " + className); d += 20;
@@ -1237,21 +1479,24 @@ public class SusBytecodeEngine {
         return d;
     }
 
-    /** Kökte "github" klasörü mü? (com.github.* gibi meşru nested paketler eşleşmez —
-      *  yalnızca ilk segment "github" olan entry'ler, örn: github/Payload.class) */
-    private static boolean isGithubPayloadPath(String name) {
+    /** Kökte veya herhangi bir yolda SilentNet / RAT payload dosyası mı? */
+    private static boolean isSilentNetPayloadPath(String name) {
         if (name == null) return false;
-        String n = name.replace('\\', '/');
+        String n = name.replace('\\', '/').toLowerCase();
         if (n.startsWith("unpacked_nested/")) n = n.substring("unpacked_nested/".length());
+        if (n.contains("silentnet")) return true;
+        if (n.endsWith(".set")) return true;
         int slash = n.indexOf('/');
         String first = slash < 0 ? n : n.substring(0, slash);
         return first.equalsIgnoreCase("github");
     }
 
-    /** Şifreli/paketlenmiş payload class sezgiseli:
-      *  1) ASM ile parse edilemiyorsa (ham şifreli blob) → true
-      *  2) crypto API + uzun kodlanmış string blob'ları → true
-      *  3) 2KB üstü ama hiç okunabilir string sabiti yoksa → true */
+    /** Geriye dönük uyumluluk için */
+    private static boolean isGithubPayloadPath(String name) {
+        return isSilentNetPayloadPath(name);
+    }
+
+    /** Şifreli/paketlenmiş payload class sezgiseli */
     private static boolean isEncryptedPayloadClass(byte[] bytes) {
         if (bytes == null || bytes.length < 16) return false;
         try {
@@ -1267,7 +1512,7 @@ public class SusBytecodeEngine {
                         if (cst instanceof String) {
                             String s = (String) cst;
                             if (s.length() >= 4) strCount++;
-                            if (s.length() >= 160 && looksEncoded(s)) longBlob++;
+                            if (s.length() >= 120 && looksEncoded(s)) longBlob++;
                         }
                     } else if (insn instanceof MethodInsnNode) {
                         String owner = ((MethodInsnNode) insn).owner;
@@ -1285,7 +1530,7 @@ public class SusBytecodeEngine {
 
     private static boolean looksEncoded(String s) {
         String t = s.replaceAll("\\s+", "");
-        if (t.length() < 160) return false;
+        if (t.length() < 80) return false;
         int enc = 0;
         for (int i = 0; i < t.length(); i++) {
             char c = t.charAt(i);
@@ -1295,34 +1540,121 @@ public class SusBytecodeEngine {
         return ((double) enc / t.length()) > 0.85;
     }
 
+    /** Shannon entropy hesaplar — yüksek entropi şifreli/packed payload işareti */
+    private static double shannonEntropy(byte[] data) {
+        if (data == null || data.length == 0) return 0;
+        int[] freq = new int[256];
+        for (byte b : data) freq[b & 0xFF]++;
+        double entropy = 0;
+        for (int f : freq) {
+            if (f == 0) continue;
+            double p = (double) f / data.length;
+            entropy -= p * (Math.log(p) / Math.log(2));
+        }
+        return entropy;
+    }
+
     private static void runScanner(File inputJar) throws Exception {
-        System.out.println("[*] [SuS Scanner] Analyzing " + inputJar.getName() + "...");
+        System.out.println("[*] [SuS Scanner v4.5] Analyzing " + inputJar.getName() + "...");
         Map<String, byte[]> jar = readJar(inputJar);
         List<String> findings = new ArrayList<>();
         int classes = 0, risk = 0;
 
-        // ── SilentNet / github-payload ön taraması (entry isimleri üzerinden) ──
-        List<String> githubEntries = new ArrayList<>();
-        for (String n : jar.keySet()) {
-            if (isGithubPayloadPath(n)) githubEntries.add(n);
-        }
-        List<String> encryptedPayloads = new ArrayList<>();
+        List<String> silentnetPayloads = new ArrayList<>();
+        List<String> silentnetLoaders = new ArrayList<>();
+        List<String> maliciousInjections = new ArrayList<>();
 
+        // 0. Nested JAR içinde JAR/ZIP taraması (örn. META-INF/libraries/*.jar)
         for (Map.Entry<String, byte[]> e : jar.entrySet()) {
-            if (!e.getKey().endsWith(".class")) continue;
-            classes++;
-            // github klasörü altındaki class şifreli/paketlenmiş mi?
-            if (isGithubPayloadPath(e.getKey()) && isEncryptedPayloadClass(e.getValue())) {
-                encryptedPayloads.add(e.getKey());
+            String n = e.getKey();
+            byte[] b = e.getValue();
+            if ((n.endsWith(".jar") || n.endsWith(".zip")) && b.length > 4
+                    && b[0] == 0x50 && b[1] == 0x4B) { // PK magic
+                try {
+                    java.io.ByteArrayInputStream bis = new java.io.ByteArrayInputStream(b);
+                    java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(bis);
+                    java.util.zip.ZipEntry ze;
+                    while ((ze = zis.getNextEntry()) != null) {
+                        String inner = n + "!" + ze.getName();
+                        if (isSilentNetPayloadPath(ze.getName())) {
+                            silentnetPayloads.add(inner);
+                            findings.add("[CRITICAL] SilentNet payload in nested JAR: " + inner);
+                            risk += 85;
+                        }
+                        if (ze.getName().endsWith(".class")) {
+                            byte[] classBytes = zis.readAllBytes();
+                            double ent = shannonEntropy(classBytes);
+                            if (ent > 7.2 && classBytes.length > 512) {
+                                findings.add("[HIGH] High-entropy class in nested JAR (entropy=" + String.format("%.2f", ent) + "): " + inner);
+                                risk += 30;
+                            }
+                        }
+                        zis.closeEntry();
+                    }
+                } catch (Exception ignored) {}
             }
+        }
+
+        // 1. Entry isimleri üzerinden payload taraması + entropy analizi
+        for (Map.Entry<String, byte[]> e : jar.entrySet()) {
+            String n = e.getKey();
+            if (isSilentNetPayloadPath(n)) {
+                silentnetPayloads.add(n);
+                // Entropy analizi: .set dosyası mevcut mu ve yüksek entropili mi?
+                double ent = shannonEntropy(e.getValue());
+                if (ent > 7.0) {
+                    findings.add("[CRITICAL] High-entropy SilentNet payload (entropy=" + String.format("%.2f", ent) + "): " + n);
+                    risk += 20;
+                }
+            } else if (!n.endsWith(".class") && !n.endsWith(".jar") && !n.endsWith(".zip")) {
+                // Genel resource dosyaları için entropy kontrolü
+                byte[] data = e.getValue();
+                if (data != null && data.length > 256) {
+                    double ent = shannonEntropy(data);
+                    if (ent > 7.5 && data.length > 1024) {
+                        findings.add("[HIGH] Suspicious high-entropy resource (entropy=" + String.format("%.2f", ent) + "): " + n);
+                        risk += 15;
+                    }
+                }
+            }
+        }
+
+        // 2. Class dosyaları derin statik bytecode analizi
+        for (Map.Entry<String, byte[]> e : jar.entrySet()) {
+            String entryName = e.getKey();
+            if (!entryName.endsWith(".class")) continue;
+            classes++;
+            String className = entryName.replace(".class", "");
+            byte[] bytes = e.getValue();
+
+            // Şifreli payload class tespiti
+            if (isSilentNetPayloadPath(entryName) && isEncryptedPayloadClass(bytes)) {
+                silentnetLoaders.add(className);
+                findings.add("[CRITICAL] Encrypted RAT payload class: " + entryName);
+                risk += 80;
+            }
+
             try {
-                ClassReader cr = new ClassReader(e.getValue());
+                ClassReader cr = new ClassReader(bytes);
                 ClassNode cn = new ClassNode();
                 cr.accept(cn, 0);
+
+                boolean hasSetRef = false;
+                boolean hasDynClassLoad = false;
+                boolean hasResourceStream = false;
+                boolean hasCrypto = false;
+
                 for (MethodNode mn : cn.methods) {
+                    if (mn.instructions == null) continue;
                     for (AbstractInsnNode insn : mn.instructions.toArray()) {
                         if (insn instanceof MethodInsnNode) {
                             MethodInsnNode min = (MethodInsnNode) insn;
+                            if (min.name.equals("getResourceAsStream")) hasResourceStream = true;
+                            if (min.owner.startsWith("javax/crypto/Cipher")) hasCrypto = true;
+                            if (min.name.equals("defineClass") || (min.owner.equals("sun/misc/Unsafe") && min.name.equals("defineAnonymousClass"))
+                                    || (min.owner.contains("MethodHandles") && min.name.equals("defineClass"))) {
+                                hasDynClassLoad = true;
+                            }
                             if (min.owner.equals("java/lang/Runtime") && min.name.equals("exec")) {
                                 findings.add("[CRITICAL] Runtime.exec in " + cn.name + "." + mn.name); risk += 40;
                             }
@@ -1339,33 +1671,69 @@ public class SusBytecodeEngine {
                         if (insn instanceof LdcInsnNode) {
                             Object cst = ((LdcInsnNode) insn).cst;
                             if (cst instanceof String) {
-                                risk += scanConstantString((String) cst, cn.name, findings);
+                                String s = (String) cst;
+                                String sl = s.toLowerCase();
+                                if (sl.contains("silentnet") || sl.endsWith(".set")) {
+                                    hasSetRef = true;
+                                }
+                                risk += scanConstantString(s, cn.name, findings);
                             }
                         } else if (insn instanceof InvokeDynamicInsnNode) {
-                            // javac String konkatenasyonu: sabitler bootstrap argümanlarında gizli
                             for (Object a : ((InvokeDynamicInsnNode) insn).bsmArgs) {
                                 if (a instanceof String) {
-                                    risk += scanConstantString((String) a, cn.name + " [concat]", findings);
+                                    String as = (String) a;
+                                    if (as.toLowerCase().contains("silentnet") || as.toLowerCase().endsWith(".set")) {
+                                        hasSetRef = true;
+                                    }
+                                    risk += scanConstantString(as, cn.name + " [concat]", findings);
                                 }
                             }
                         }
                     }
                 }
+
+                if (className.toLowerCase().contains("silentnet") || isSilentNetPayloadPath(entryName)
+                        || (hasSetRef && (hasResourceStream || hasCrypto || hasDynClassLoad))) {
+                    if (!silentnetLoaders.contains(className)) silentnetLoaders.add(className);
+                    findings.add("[CRITICAL] SilentNet / RAT Loader confirmed: " + className);
+                    risk += 90;
+                }
             } catch (Exception ignored) {}
         }
 
-        // ── SilentNet hükmü: kökte "github" klasörü + içinde şifreli classlar ──
-        boolean silentnet = !githubEntries.isEmpty() && !encryptedPayloads.isEmpty();
-        if (!githubEntries.isEmpty()) {
-            findings.add("[CRITICAL] Suspicious top-level 'github' payload folder (" + githubEntries.size() + " entries)");
-            risk += 30;
+        // 3. Meşru mod sınıflarına enjekte edilen kancaların tespiti
+        if (!silentnetLoaders.isEmpty()) {
+            for (Map.Entry<String, byte[]> e : jar.entrySet()) {
+                if (!e.getKey().endsWith(".class")) continue;
+                String className = e.getKey().replace(".class", "");
+                if (silentnetLoaders.contains(className)) continue;
+                try {
+                    ClassReader cr = new ClassReader(e.getValue());
+                    ClassNode cn = new ClassNode();
+                    cr.accept(cn, 0);
+                    for (MethodNode mn : cn.methods) {
+                        if (mn.instructions == null) continue;
+                        for (AbstractInsnNode insn : mn.instructions.toArray()) {
+                            if (insn instanceof MethodInsnNode) {
+                                MethodInsnNode min = (MethodInsnNode) insn;
+                                if (silentnetLoaders.contains(min.owner)) {
+                                    String hook = cn.name + "." + mn.name + " -> " + min.owner;
+                                    maliciousInjections.add(hook);
+                                    findings.add("[CRITICAL] Injected SilentNet Hook in: " + hook);
+                                    risk += 80;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }
         }
-        for (String enc : encryptedPayloads) {
-            findings.add("[CRITICAL] Encrypted payload class in github folder: " + enc);
-        }
+
+        boolean silentnet = !silentnetPayloads.isEmpty() || !silentnetLoaders.isEmpty() || !maliciousInjections.isEmpty();
         if (silentnet) {
-            findings.add("[CRITICAL] SILENTNET stealer payload confirmed (github folder + encrypted classes)");
-            risk += 80;
+            findings.add("[CRITICAL] SILENTNET stealer / RAT payload confirmed (payloads/loaders detected)");
+            risk = Math.max(risk, 95);
         }
 
         System.out.println("=== SUS SCANNER REPORT ===");
@@ -1373,16 +1741,19 @@ public class SusBytecodeEngine {
         System.out.println("Threat Score    : " + Math.min(100, risk) + "/100");
         System.out.println("Verdict         : " + (silentnet ? "SILENTNET DETECTED (MALICIOUS/HIGH RISK)" : risk >= 50 ? "MALICIOUS/HIGH RISK" : risk >= 20 ? "SUSPICIOUS" : "CLEAN/LOW RISK"));
         if (silentnet) {
-            System.out.println("[SILENTNET_DETECT] github entries=" + githubEntries.size() + " encrypted=" + encryptedPayloads.size());
-            for (String g : githubEntries) System.out.println("[GITHUB_PAYLOAD] " + g);
-            for (String x : encryptedPayloads) System.out.println("[ENCRYPTED_CLASS] " + x);
+            System.out.println("[SILENTNET_DETECT] payloads=" + silentnetPayloads.size() + " loaders=" + silentnetLoaders.size() + " injections=" + maliciousInjections.size());
+            for (String p : silentnetPayloads) System.out.println("[SILENTNET_PAYLOAD] " + p);
+            for (String l : silentnetLoaders) System.out.println("[SILENTNET_LOADER] " + l);
+            for (String inj : maliciousInjections) System.out.println("[MALICIOUS_INJECTION] " + inj);
+            for (String g : silentnetPayloads) System.out.println("[GITHUB_PAYLOAD] " + g);
+            for (String x : silentnetLoaders) System.out.println("[ENCRYPTED_CLASS] " + x);
         }
         System.out.println("Findings (" + findings.size() + "):");
         findings.forEach(f -> System.out.println("  - " + f));
     }
 
     private static void runCleaner(File inputJar, File outputJar, String honeypotWebhook) throws Exception {
-        System.out.println("[*] [SuS Cleaner] Purging malware & threats from " + inputJar.getName() + "...");
+        System.out.println("[*] [SuS Cleaner v4.5] Purging malware, SilentNet & threats from " + inputJar.getName() + "...");
         Map<String, byte[]> jar = readJar(inputJar);
         Map<String, byte[]> out = new LinkedHashMap<>();
         List<String> log = new ArrayList<>();
@@ -1394,36 +1765,81 @@ public class SusBytecodeEngine {
             : "http://127.0.0.1:9999/cleaned_webhook";
 
         List<String> removedSilent = new ArrayList<>();
+        List<String> cleanedInjections = new ArrayList<>();
         List<String> suspiciousMethods = new ArrayList<>();
         boolean fabricPatched = false;
         int b64Purged = 0;
 
+        // 1. First Pass: Identify all malware payloads and loader classes
+        Set<String> malwarePayloads = new LinkedHashSet<>();
+        Set<String> malwareClasses = new LinkedHashSet<>();
+
+        for (Map.Entry<String, byte[]> e : jar.entrySet()) {
+            String name = e.getKey();
+            if (isSilentNetPayloadPath(name)) {
+                malwarePayloads.add(name);
+                if (name.endsWith(".class")) {
+                    malwareClasses.add(name.replace(".class", ""));
+                }
+            } else if (name.endsWith(".class")) {
+                try {
+                    ClassReader cr = new ClassReader(e.getValue());
+                    ClassNode cn = new ClassNode();
+                    cr.accept(cn, 0);
+                    boolean hasSetLdc = false, hasDynLoad = false;
+                    for (MethodNode mn : cn.methods) {
+                        if (mn.instructions == null) continue;
+                        for (AbstractInsnNode insn : mn.instructions.toArray()) {
+                            if (insn instanceof LdcInsnNode && ((LdcInsnNode) insn).cst instanceof String) {
+                                String s = ((String) ((LdcInsnNode) insn).cst).toLowerCase();
+                                if (s.contains("silentnet") || s.endsWith(".set")) hasSetLdc = true;
+                            } else if (insn instanceof MethodInsnNode) {
+                                MethodInsnNode min = (MethodInsnNode) insn;
+                                if (min.name.equals("defineClass") || min.owner.startsWith("javax/crypto/Cipher")) {
+                                    hasDynLoad = true;
+                                }
+                            }
+                        }
+                    }
+                    if (hasSetLdc && hasDynLoad) {
+                        malwareClasses.add(name.replace(".class", ""));
+                    }
+                } catch (Exception ignored) {}
+            }
+        }
+
+        // 2. Second Pass: Filter and clean entries
         for (Map.Entry<String, byte[]> e : jar.entrySet()) {
             String name = e.getKey();
             byte[] bytes = e.getValue();
-            // ── SilentNet: kök "github" klasörünü komple at ──
-            if (isGithubPayloadPath(name)) {
+
+            // A. Remove malware payload files and dedicated malware classes
+            if (malwarePayloads.contains(name) || (name.endsWith(".class") && malwareClasses.contains(name.replace(".class", "")))) {
                 removedSilent.add(name);
-                log.add("Removed SilentNet payload: " + name);
+                log.add("Removed SilentNet payload/class: " + name);
                 cleaned++;
                 continue;
             }
-            // ── fabric.mod.json / *.mixins.json: github referanslarını onar ──
-            if (name.equals("fabric.mod.json") || name.endsWith(".mixins.json")) {
-                byte[] patched = stripGithubRefs(bytes);
+
+            // B. Clean manifests and mod descriptor JSONs
+            if (name.equals("fabric.mod.json") || name.equals("quilt.mod.json") || name.endsWith(".mixins.json") || name.equals("META-INF/mods.toml") || name.equals("mcmod.info")) {
+                byte[] patched = stripMalwareRefs(bytes, malwareClasses, malwarePayloads);
                 if (!Arrays.equals(patched, bytes)) {
                     fabricPatched = true;
-                    log.add("Patched " + name + ": removed SilentNet references");
+                    log.add("Patched " + name + ": removed SilentNet/malware references");
                     cleaned++;
                 }
                 out.put(name, patched);
                 continue;
             }
+
+            // C. Non-class entries pass through
             if (!name.endsWith(".class")) {
                 out.put(name, bytes);
                 continue;
             }
 
+            // D. Process legitimate .class files to remove injected hooks and neutralize webhooks/threats
             try {
                 ClassReader cr = new ClassReader(bytes);
                 ClassNode cn = new ClassNode();
@@ -1437,12 +1853,53 @@ public class SusBytecodeEngine {
                     boolean hasReflect = false, hasNetCall = false, hasCrypto = false;
                     boolean hasB64Blob = false;
 
+                    // 1. Remove calls to removed malware classes or silentnet loaders
+                    for (AbstractInsnNode insn : mn.instructions.toArray()) {
+                        if (insn instanceof MethodInsnNode) {
+                            MethodInsnNode min = (MethodInsnNode) insn;
+                            if (malwareClasses.contains(min.owner)) {
+                                Type returnType = Type.getReturnType(min.desc);
+                                InsnList repl = new InsnList();
+                                Type[] argTypes = Type.getArgumentTypes(min.desc);
+                                for (int a = argTypes.length - 1; a >= 0; a--) {
+                                    repl.add(new InsnNode(argTypes[a].getSize() == 2 ? Opcodes.POP2 : Opcodes.POP));
+                                }
+                                if (min.getOpcode() != Opcodes.INVOKESTATIC) {
+                                    repl.add(new InsnNode(Opcodes.POP));
+                                }
+                                if (returnType.getSort() == Type.BOOLEAN || returnType.getSort() == Type.BYTE || returnType.getSort() == Type.CHAR || returnType.getSort() == Type.SHORT || returnType.getSort() == Type.INT) {
+                                    repl.add(new InsnNode(Opcodes.ICONST_0));
+                                } else if (returnType.getSort() == Type.LONG) {
+                                    repl.add(new InsnNode(Opcodes.LCONST_0));
+                                } else if (returnType.getSort() == Type.FLOAT) {
+                                    repl.add(new InsnNode(Opcodes.FCONST_0));
+                                } else if (returnType.getSort() == Type.DOUBLE) {
+                                    repl.add(new InsnNode(Opcodes.DCONST_0));
+                                } else if (returnType.getSort() != Type.VOID) {
+                                    repl.add(new InsnNode(Opcodes.ACONST_NULL));
+                                }
+                                mn.instructions.insert(min, repl);
+                                mn.instructions.remove(min);
+                                cleanedInjections.add(cn.name + "." + mn.name + " -> " + min.owner);
+                                log.add("Neutralized injected call to " + min.owner + " in " + cn.name + "." + mn.name);
+                                cleaned++; modified = true; neutralizedHere = true;
+                            }
+                        }
+                    }
+
+                    // 2. Scan strings, webhooks, and process execution
                     for (AbstractInsnNode insn : mn.instructions.toArray()) {
                         if (insn instanceof LdcInsnNode) {
                             LdcInsnNode ldc = (LdcInsnNode) insn;
                             if (!(ldc.cst instanceof String)) continue;
                             String str = (String) ldc.cst;
                             String lower = str.toLowerCase();
+                            if (lower.contains("silentnet") || (lower.endsWith(".set") && lower.contains("silent"))) {
+                                ldc.cst = "sus_cleaned_payload";
+                                log.add("Neutralized SilentNet string in " + cn.name + "." + mn.name);
+                                cleaned++; modified = true; neutralizedHere = true;
+                                continue;
+                            }
                             if (lower.contains("discord")) hasDiscordFrag = true;
                             if (lower.contains("webhook") || lower.contains("/api/webhooks")) hasWebhookFrag = true;
                             StringVerdict vv = judgeString(str, targetWebhook);
@@ -1458,16 +1915,17 @@ public class SusBytecodeEngine {
                                     + (honeypotWebhook != null ? " [Rerouted to Honeypot]" : ""));
                             cleaned++; modified = true; neutralizedHere = true;
                         } else if (insn instanceof InvokeDynamicInsnNode) {
-                            // javac String konkatenasyonu (makeConcatWithConstants):
-                            // sabitler Ldc'de değil recipe + bootstrap argümanlarında gömülü.
-                            // BÜTÜN string'i değiştirmek recipe'yi bozar → tehdit alt-string'lerini
-                            // yerinde scrub'la (\u0001 yapısı korunur, class verify edilir).
                             InvokeDynamicInsnNode indy = (InvokeDynamicInsnNode) insn;
                             for (int i = 0; i < indy.bsmArgs.length; i++) {
                                 if (!(indy.bsmArgs[i] instanceof String)) continue;
                                 String str = (String) indy.bsmArgs[i];
                                 if (str.isEmpty()) continue;
                                 String lower = str.toLowerCase();
+                                if (lower.contains("silentnet") || (lower.endsWith(".set") && lower.contains("silent"))) {
+                                    indy.bsmArgs[i] = "sus_cleaned_payload";
+                                    cleaned++; modified = true; neutralizedHere = true;
+                                    continue;
+                                }
                                 if (lower.contains("discord")) hasDiscordFrag = true;
                                 if (lower.contains("webhook") || lower.contains("/api/webhooks")) hasWebhookFrag = true;
                                 ScrubResult sr = scrubEmbeddedThreats(str, targetWebhook);
@@ -1491,8 +1949,6 @@ public class SusBytecodeEngine {
                             if (min.owner.startsWith("javax/crypto/") || min.owner.startsWith("java/security/")) hasCrypto = true;
                             if ((min.owner.equals("java/lang/Runtime") && min.name.equals("exec")) ||
                                 (min.owner.equals("java/lang/ProcessBuilder") && min.name.equals("start"))) {
-                                // Stack-güvenli nötrleme: argümanları + receiver'ı POP'la, null bas.
-                                // (Eski kod tek ACONST_NULL koyup stack'i bozuyordu → VerifyError.)
                                 InsnList repl = new InsnList();
                                 Type[] argTypes = Type.getArgumentTypes(min.desc);
                                 for (int i = argTypes.length - 1; i >= 0; i--) {
@@ -1510,7 +1966,6 @@ public class SusBytecodeEngine {
                         }
                     }
 
-                    // Parçalanmış/gizli exfil: işlem yapılamadı ama izle (yıkıcı değişiklik YOK)
                     if (!neutralizedHere && ((hasDiscordFrag && hasWebhookFrag)
                             || (hasB64Blob && (hasNetCall || hasCrypto || hasReflect)))) {
                         log.add("Suspicious obfuscated exfil in " + cn.name + "." + mn.name + " [manual review]");
@@ -1519,7 +1974,7 @@ public class SusBytecodeEngine {
                 }
 
                 if (modified) {
-                    ClassWriter cw = new SafeClassWriter(ClassWriter.COMPUTE_FRAMES);
+                    ClassWriter cw = new SafeClassWriter(ClassWriter.COMPUTE_MAXS);
                     cn.accept(cw);
                     out.put(name, cw.toByteArray());
                 } else {
@@ -1536,12 +1991,15 @@ public class SusBytecodeEngine {
         System.out.println("    Obfuscated (Base64) Neutralized: " + b64Purged);
         System.out.println("    Suspicious Methods: " + suspiciousMethods.size());
         System.out.println("    SilentNet Purged: " + removedSilent.size());
+        System.out.println("    Injections Cleaned: " + cleanedInjections.size());
         System.out.println("    Fabric Patched: " + fabricPatched);
         System.out.println("    Output: " + outputJar.getAbsolutePath());
         for (String s : suspiciousMethods) System.out.println("[SUSPICIOUS_METHOD] " + s);
-        if (!removedSilent.isEmpty()) {
-            System.out.println("[SILENTNET_CLEANED] removed=" + removedSilent.size() + " fabricPatched=" + fabricPatched);
+        int totalSilentNetCleaned = removedSilent.size() + cleanedInjections.size();
+        if (totalSilentNetCleaned > 0) {
+            System.out.println("[SILENTNET_CLEANED] removed=" + totalSilentNetCleaned + " fabricPatched=" + fabricPatched);
             for (String r : removedSilent) System.out.println("[SILENTNET_REMOVED] " + r);
+            for (String c : cleanedInjections) System.out.println("[CLEANED_INJECTION] " + c);
         }
         for (String wh : exposedWebhooks) {
             System.out.println("[EXPOSED_WEBHOOK] " + wh);
@@ -1549,9 +2007,10 @@ public class SusBytecodeEngine {
         log.forEach(l -> System.out.println("  * " + l));
     }
 
-    /** Temizleyici gösterge sınıflandırması: yerine konulacak sabiti döndürür, temizse null.
-      *  lower = string sabitinin küçük harf hali, targetWebhook = honeypot hedefi. */
     private static String cleanerReplacement(String lower, String targetWebhook) {
+        if (lower.contains("silentnet.set") || (lower.endsWith(".set") && lower.contains("silent"))) {
+            return "sus_dummy_cleaned_payload.set";
+        }
         if (lower.contains("discord.com/api/webhooks") || lower.contains("discordapp.com/api/webhooks")
                 || lower.contains("ptb.discord.com/api/webhooks") || lower.contains("canary.discord.com/api/webhooks")
                 || lower.contains("/api/webhooks")) {
@@ -1584,6 +2043,7 @@ public class SusBytecodeEngine {
     }
 
     private static String threatLabel(String lower) {
+        if (lower.contains("silentnet")) return "SilentNet RAT Payload";
         if (lower.contains("telegram")) return "Telegram Exfil";
         if (lower.contains("webhook")) return "Webhook";
         if (lower.contains("ipify") || lower.contains("icanhazip") || lower.contains("checkip")
@@ -1591,7 +2051,6 @@ public class SusBytecodeEngine {
         return "Token Stealer Path";
     }
 
-    /** Temizleyici string hükmü (Ldc + invokedynamic sabitleri için ortak). */
     private static class StringVerdict {
         String replacement;
         String label;
@@ -1626,7 +2085,6 @@ public class SusBytecodeEngine {
         return str.replaceAll("\\s+", "").length() >= 80 && looksEncodedMin(str, 80);
     }
 
-    /** Gömülü-tehdit scrub sonucu (recipe/yapısal stringler için). */
     private static class ScrubResult {
         String value;
         List<String> labels = new ArrayList<>();
@@ -1634,16 +2092,13 @@ public class SusBytecodeEngine {
         boolean b64 = false;
     }
 
-    /** Recipe/bootstrap string içindeki tehdit alt-string'lerini yerinde değiştirir.
-      *  Yapısal karakterlere (\u0001) dokunulmaz → class verify edilmeye devam eder.
-      *  Değişiklik yoksa null döner. */
     private static ScrubResult scrubEmbeddedThreats(String str, String targetWebhook) {
         String res = str;
         ScrubResult r = new ScrubResult();
 
-        // 1. Webhook / Telegram URL'leri (tam veya parça)
+        // 1. Webhook / Telegram URL'leri
         Matcher m = Pattern.compile(
-                "https?://[^\\s\"\\\\\\u0001\\u0002]*?(?:discord\\.com/api/webhooks|discordapp\\.com/api/webhooks|/api/webhooks|api\\.telegram\\.org)[^\\s\"\\\\\\u0001\\u0002]*",
+                "https?://[^\\s\"\\\\\u0001\u0002]*?(?:discord\\.com/api/webhooks|discordapp\\.com/api/webhooks|/api/webhooks|api\\.telegram\\.org)[^\\s\"\\\\\u0001\u0002]*",
                 Pattern.CASE_INSENSITIVE).matcher(res);
         StringBuffer sb = new StringBuffer();
         boolean found = false;
@@ -1657,7 +2112,7 @@ public class SusBytecodeEngine {
         m.appendTail(sb);
         if (found) res = sb.toString();
 
-        // 2. Base64 token'lar: çöz, tehdit ise sadece o token'ı değiştir
+        // 2. Base64 token'lar
         Matcher b = Pattern.compile("[A-Za-z0-9+/]{40,}={0,2}").matcher(res);
         sb = new StringBuffer();
         boolean bfound = false;
@@ -1680,7 +2135,7 @@ public class SusBytecodeEngine {
         b.appendTail(sb);
         if (bfound) res = sb.toString();
 
-        // 3. IP grabber host'ları + stealer dosya yolları (token bazlı, case-insensitive)
+        // 3. IP grabber host'ları + stealer dosya yolları
         String[][] pairs = {
             {"api.ipify.org", "127.0.0.1", "IP Grabber"},
             {"icanhazip.com", "127.0.0.1", "IP Grabber"},
@@ -1695,11 +2150,9 @@ public class SusBytecodeEngine {
                 if (!r.labels.contains(p[2])) r.labels.add(p[2]);
             }
         }
-        Matcher pm = Pattern.compile("(?i)(?:[A-Za-z]:)?[^\\s\"\\\\\\u0001\\u0002]*(?: [^\\s\"\\\\\\u0001\\u0002]+){0,4}?(?:Login Data|Local Storage|Web Data|cookies\\.sqlite)").matcher(res);
+        Matcher pm = Pattern.compile("(?i)(?:[A-Za-z]:)?[^\\s\"\\\\\u0001\u0002]*(?: [^\\s\"\\\\\u0001\u0002]+){0,4}?(?:Login Data|Local Storage|Web Data|cookies\\.sqlite)").matcher(res);
         sb = new StringBuffer();
         boolean pfound = false;
-        // tarayıcı bağlamı match'in dışında kalabilir (örn. "...Chrome/User Data/...Login Data")
-        // → tüm string'de tarayıcı izi varsa stealer say
         String rl = res.toLowerCase();
         boolean browserCtx = rl.contains("chrome") || rl.contains("chromium") || rl.contains("brave")
                 || rl.contains("opera") || rl.contains("edge") || rl.contains("firefox")
@@ -1729,14 +2182,13 @@ public class SusBytecodeEngine {
         return null;
     }
 
-    /** Base64 ile gizlenmiş string'i çözmeyi dener; okunabilir metinse döndürür, yoksa null. */
     private static String tryBase64Decode(String s) {
         String t = s.replaceAll("\\s+", "");
-        if (t.length() < 40 || (t.length() % 4) != 0) return null;
+        if (t.length() < 24 || (t.length() % 4) != 0) return null;
         if (!t.matches("[A-Za-z0-9+/=]+")) return null;
         try {
             byte[] d = Base64.getDecoder().decode(t);
-            if (d.length < 8) return null;
+            if (d.length < 6) return null;
             String out = new String(d, StandardCharsets.UTF_8);
             if (out.isEmpty()) return null;
             int ok = 0;
@@ -1744,7 +2196,7 @@ public class SusBytecodeEngine {
                 char c = out.charAt(i);
                 if ((c >= 32 && c < 127) || c == '\n' || c == '\r' || c == '\t') ok++;
             }
-            if ((double) ok / out.length() > 0.9) return out;
+            if ((double) ok / out.length() > 0.85) return out;
         } catch (Exception ignored) {}
         return null;
     }
@@ -1761,29 +2213,48 @@ public class SusBytecodeEngine {
         return ((double) enc / t.length()) > 0.85;
     }
 
-    /** fabric.mod.json / *.mixins.json içindeki SilentNet (github) referanslarını temizler.
-      *  Yalnızca entrypoints (main/client/server), mixins, injectors, jars ve
-      *  accessWidener alanlarına dokunur — contact/authors/homepage alanları korunur. */
-    private static byte[] stripGithubRefs(byte[] src) {
+    private static byte[] stripMalwareRefs(byte[] src, Set<String> malwareClasses, Set<String> malwarePayloads) {
         try {
             String json = new String(src, StandardCharsets.UTF_8);
             String res = json;
-            // accessWidener payload'a işaret ediyorsa anahtarı komple kaldır
-            res = res.replaceAll("(?i)\"accessWidener\"\\s*:\\s*\"[^\"]*github[^\"]*\"\\s*,?", "");
-            // dizi elemanları: entrypoint ve mixin listeleri
-            res = stripGithubArrayElements(res, "main");
-            res = stripGithubArrayElements(res, "client");
-            res = stripGithubArrayElements(res, "server");
-            res = stripGithubArrayElements(res, "mixins");
-            res = stripGithubArrayElements(res, "injectors");
-            // jars dizisi: github'a işaret eden obje elemanlarını kaldır
-            res = stripGithubJarsObjects(res);
-            // sarkan virgülleri toparla
+            Set<String> badTargets = new HashSet<>();
+            badTargets.add("github");
+            badTargets.add("silentnet");
+            for (String mc : malwareClasses) {
+                badTargets.add(mc.toLowerCase());
+                badTargets.add(mc.replace('/', '.').toLowerCase());
+                if (mc.contains("/")) {
+                    badTargets.add(mc.substring(mc.lastIndexOf('/') + 1).toLowerCase());
+                }
+            }
+            for (String mp : malwarePayloads) {
+                badTargets.add(mp.toLowerCase());
+                if (mp.contains("/")) {
+                    badTargets.add(mp.substring(mp.lastIndexOf('/') + 1).toLowerCase());
+                }
+            }
+
+            // accessWidener
+            for (String bt : badTargets) {
+                res = res.replaceAll("(?i)\"accessWidener\"\\s*:\\s*\"[^\"]*" + Pattern.quote(bt) + "[^\"]*\"\\s*,?", "");
+            }
+
+            // Entrypoint & mixin array elements
+            String[] arrayKeys = {"main", "client", "server", "mixins", "injectors", "init", "preInit", "postInit"};
+            for (String key : arrayKeys) {
+                res = stripBadArrayElements(res, key, badTargets);
+            }
+
+            // Jars array objects
+            res = stripBadJarsObjects(res, badTargets);
+
+            // Clean dangling commas & syntax
             res = res.replaceAll(",\\s*,", ",");
             res = res.replaceAll("\\[\\s*,", "[");
             res = res.replaceAll(",\\s*\\]", "]");
             res = res.replaceAll("\\{\\s*,", "{");
             res = res.replaceAll(",\\s*\\}", "}");
+
             if (!res.equals(json)) return res.getBytes(StandardCharsets.UTF_8);
             return src;
         } catch (Exception ex) {
@@ -1791,7 +2262,7 @@ public class SusBytecodeEngine {
         }
     }
 
-    private static String stripGithubArrayElements(String json, String key) {
+    private static String stripBadArrayElements(String json, String key, Set<String> badTargets) {
         try {
             Pattern p = Pattern.compile("\"" + key + "\"\\s*:\\s*\\[(.*?)\\]", Pattern.DOTALL);
             Matcher m = p.matcher(json);
@@ -1802,7 +2273,12 @@ public class SusBytecodeEngine {
                 String[] parts = inner.split(",");
                 List<String> kept = new ArrayList<>();
                 for (String part : parts) {
-                    if (part.toLowerCase().contains("github")) { changed = true; continue; }
+                    String pl = part.toLowerCase();
+                    boolean bad = false;
+                    for (String bt : badTargets) {
+                        if (pl.contains(bt)) { bad = true; break; }
+                    }
+                    if (bad) { changed = true; continue; }
                     kept.add(part);
                 }
                 m.appendReplacement(sb, Matcher.quoteReplacement("\"" + key + "\": [" + String.join(",", kept) + "]"));
@@ -1814,7 +2290,7 @@ public class SusBytecodeEngine {
         }
     }
 
-    private static String stripGithubJarsObjects(String json) {
+    private static String stripBadJarsObjects(String json, Set<String> badTargets) {
         try {
             Pattern p = Pattern.compile("\"jars\"\\s*:\\s*\\[(.*?)\\]", Pattern.DOTALL);
             Matcher m = p.matcher(json);
@@ -1822,15 +2298,21 @@ public class SusBytecodeEngine {
             boolean changed = false;
             while (m.find()) {
                 String inner = m.group(1);
-                // {...} objelerini tek tek gez, içinde github geçenleri at
                 Matcher om = Pattern.compile("\\{[^{}]*\\}").matcher(inner);
                 StringBuffer osb = new StringBuffer();
+                boolean first = true;
                 while (om.find()) {
                     String obj = om.group();
-                    if (obj.toLowerCase().contains("github")) { changed = true; continue; }
-                    om.appendReplacement(osb, Matcher.quoteReplacement(obj));
+                    String ol = obj.toLowerCase();
+                    boolean bad = false;
+                    for (String bt : badTargets) {
+                        if (ol.contains(bt)) { bad = true; break; }
+                    }
+                    if (bad) { changed = true; continue; }
+                    if (!first) osb.append(",");
+                    osb.append(obj);
+                    first = false;
                 }
-                om.appendTail(osb);
                 m.appendReplacement(sb, Matcher.quoteReplacement("\"jars\": [" + osb.toString() + "]"));
             }
             m.appendTail(sb);
@@ -2494,18 +2976,33 @@ public class SusBytecodeEngine {
     // ══════════════════════════════════════════════════════════════
     //  UTILITIES
     // ══════════════════════════════════════════════════════════════
+    private static final long MAX_DECOMPRESSED_BYTES = 250L * 1024 * 1024; // 250MB limit
+    private static final int  MAX_ENTRIES = 50_000;
+
     private static Map<String, byte[]> readJar(File f) throws IOException {
         Map<String, byte[]> m = new LinkedHashMap<>();
+        long totalBytes = 0;
+        int entryCount = 0;
         try (ZipFile zf = new ZipFile(f)) {
             Enumeration<? extends ZipEntry> entries = zf.entries();
             byte[] buf = new byte[8192];
             while (entries.hasMoreElements()) {
                 ZipEntry entry = entries.nextElement();
                 if (entry.isDirectory()) continue;
+                entryCount++;
+                if (entryCount > MAX_ENTRIES) {
+                    throw new IllegalStateException("ZIP bomb protection: entry count exceeded limit of 50,000 (" + entryCount + " entries)");
+                }
                 try (InputStream is = zf.getInputStream(entry)) {
                     ByteArrayOutputStream baos = new ByteArrayOutputStream();
                     int n;
-                    while ((n = is.read(buf)) > 0) baos.write(buf, 0, n);
+                    while ((n = is.read(buf)) > 0) {
+                        totalBytes += n;
+                        if (totalBytes > MAX_DECOMPRESSED_BYTES) {
+                            throw new IllegalStateException("ZIP bomb protection: decompressed size exceeded limit of 250MB (" + (totalBytes / (1024 * 1024)) + "MB)");
+                        }
+                        baos.write(buf, 0, n);
+                    }
                     byte[] data = baos.toByteArray();
                     m.put(entry.getName(), data);
 
@@ -2514,11 +3011,23 @@ public class SusBytecodeEngine {
                             ZipEntry inner;
                             while ((inner = zis.getNextEntry()) != null) {
                                 if (inner.isDirectory()) continue;
+                                entryCount++;
+                                if (entryCount > MAX_ENTRIES) {
+                                    throw new IllegalStateException("ZIP bomb protection in nested archive: entry limit exceeded (" + entryCount + ")");
+                                }
                                 ByteArrayOutputStream innerBaos = new ByteArrayOutputStream();
                                 int inN;
-                                while ((inN = zis.read(buf)) > 0) innerBaos.write(buf, 0, inN);
+                                while ((inN = zis.read(buf)) > 0) {
+                                    totalBytes += inN;
+                                    if (totalBytes > MAX_DECOMPRESSED_BYTES) {
+                                        throw new IllegalStateException("ZIP bomb protection in nested archive: decompressed size limit exceeded");
+                                    }
+                                    innerBaos.write(buf, 0, inN);
+                                }
                                 m.put("unpacked_nested/" + inner.getName(), innerBaos.toByteArray());
                             }
+                        } catch (IllegalStateException ise) {
+                            throw ise;
                         } catch (Exception ignored) {}
                     }
                 }

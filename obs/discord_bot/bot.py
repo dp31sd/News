@@ -7,6 +7,10 @@ import random
 import re
 import time
 import datetime
+import hashlib
+import zipfile
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import urlparse
 import discord
@@ -22,7 +26,8 @@ try:
         get_afk, set_afk, remove_afk,
         add_warn, get_warns, clear_warns,
         add_ticket, get_ticket, remove_ticket,
-        check_and_increment_quota
+        check_and_increment_quota,
+        get_cached_scan, save_cached_scan
     )
     from utils.rank_card import create_rank_card
     from utils.progress import LiveProgressTracker
@@ -93,6 +98,22 @@ DATA_DIR   = BASE_DIR / "data"
 
 for _d in [TEMP_DIR, OUTPUT_DIR, DATA_DIR]:
     _d.mkdir(exist_ok=True)
+
+# ─── Yapısal Log Sistemi ──────────────────────
+log_file = DATA_DIR / "bot.log"
+log_formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s")
+
+file_handler = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+file_handler.setFormatter(log_formatter)
+
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setFormatter(log_formatter)
+
+logger = logging.getLogger("SuSBot")
+logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
+if not logger.handlers:
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
 
 TASK_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
@@ -1189,8 +1210,73 @@ async def jardeobfuscationsrc(
         await tracker.start()
 
     start_time = time.time()
+    temp_files_to_clean = [inp, clean, src]
+    extract_dir = TEMP_DIR / f"{tid}_extracted"
     try:
         await file.save(inp)
+
+        # ── Çoklu JAR ZIP İncelemesi ──
+        multi_jars = []
+        if file.filename.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(inp, 'r') as zf:
+                    j_entries = [n for n in zf.namelist() if n.lower().endswith(".jar") and not n.startswith("__MACOSX") and "/" not in n]
+                    if not j_entries:
+                        j_entries = [n for n in zf.namelist() if n.lower().endswith(".jar") and not n.startswith("__MACOSX")]
+                    if len(j_entries) > 1:
+                        extract_dir.mkdir(exist_ok=True)
+                        for jn in j_entries[:10]:  # Güvenlik için en fazla 10 JAR
+                            zf.extract(jn, extract_dir)
+                            extracted_p = extract_dir / jn
+                            if extracted_p.exists() and extracted_p.is_file():
+                                multi_jars.append(extracted_p)
+            except Exception as ze:
+                logger.warning(f"ZIP multi-jar inceleme hatası: {ze}")
+
+        if multi_jars:
+            processed_zips = []
+            failed_jars = []
+            for j_file in multi_jars:
+                sub_clean = OUTPUT_DIR / f"{tid}_clean_{j_file.name}"
+                sub_src   = OUTPUT_DIR / f"{tid}_src_{j_file.stem}.zip"
+                temp_files_to_clean.extend([sub_clean, sub_src])
+                r, sout, serr = await run_engine("deobfuscate", j_file, sub_clean, sub_src, chosen_engine)
+                if r == 0 and sub_src.exists():
+                    processed_zips.append((j_file.name, sub_src))
+                else:
+                    failed_jars.append(j_file.name)
+            
+            elapsed = round(time.time() - start_time, 2)
+            if tracker:
+                await tracker.stop()
+
+            if not processed_zips:
+                return await safe_followup(interaction, "❌ ZIP içerisindeki hiçbir JAR deobfuscate edilemedi.")
+
+            # Hepsini tek bir master ZIP altında topla
+            with zipfile.ZipFile(src, "w", compression=zipfile.ZIP_DEFLATED) as master_zip:
+                for j_name, s_path in processed_zips:
+                    master_zip.write(s_path, arcname=f"sources_{safe_filename(j_name).replace('.jar', '')}.zip")
+
+            if src.stat().st_size > 24.5 * 1024 * 1024:
+                return await safe_followup(interaction, f"⚠️ Çoklu kaynak kod ZIP arşivi (`{src.stat().st_size / (1024*1024):.1f} MB`) Discord'un 25MB sınırını aşıyor!")
+
+            e = mk_embed("⚡ SuS Deobfuscator — Çoklu JAR Kaynak Kodu Paketi",
+                f"**`{file.filename}`** ZIP arşivi içindeki tüm modlar çözüldü! (⏱️ `{elapsed}s`)\n\n"
+                f"✅ **Başarılı:** `{len(processed_zips)}` JAR\n"
+                + (f"⚠️ **Başarısız:** `{len(failed_jars)}` JAR\n" if failed_jars else "") +
+                f"\n📦 Tüm `.java` kaynak kodları arşivlendi.", 0x1ABC9C)
+
+            for j_name, s_path in processed_zips[:8]:
+                e.add_field(name=f"📄 {j_name[:30]}", value=f"`{s_path.stat().st_size / 1024:.1f} KB`", inline=True)
+
+            dfile = discord.File(src, filename=f"multi_sources_{safe_filename(file.filename).replace('.zip', '')}.zip")
+            try:
+                await safe_followup(interaction, embed=e, file=dfile)
+            finally:
+                close_discord_files([dfile])
+            return
+
         ret, stdout, stderr = await run_engine("deobfuscate", inp, clean, src, chosen_engine)
         elapsed = round(time.time() - start_time, 2)
 
@@ -1220,12 +1306,19 @@ async def jardeobfuscationsrc(
         finally:
             close_discord_files([dfile])
     except Exception as exc:
+        logger.error(f"jardeobfuscationsrc hatası: {exc}", exc_info=True)
         if tracker:
             await tracker.stop()
         await safe_followup(interaction, f"❌ Beklenmedik hata: {exc}")
     finally:
-        for _f in [inp, clean, src]:
+        for _f in temp_files_to_clean:
             safe_unlink(_f)
+        if extract_dir.exists():
+            try:
+                import shutil
+                shutil.rmtree(extract_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 @bot.tree.command(name="deobfuscationsrc", description="⚡ JAR modunun şifresini çözüp tüm .java kaynak kodlarını ve raporu ZIP olarak verir.")
@@ -1458,53 +1551,139 @@ async def jarscanner(interaction: discord.Interaction, file: discord.Attachment)
 
     try:
         await file.save(inp)
-        ret, stdout, stderr = await run_engine("scan", inp)
-        if tracker:
-            await tracker.stop()
+        file_sha256 = ""
+        try:
+            with open(inp, "rb") as _f:
+                file_sha256 = hashlib.sha256(_f.read()).hexdigest()
+        except Exception as _she:
+            logger.warning(f"SHA-256 hesaplama hatası: {_she}")
 
-        raw = stdout or stderr or ""
-        output = redact_urls(raw)
+        cached = None
+        if DB_AVAILABLE and file_sha256:
+            try:
+                cached = await get_cached_scan(file_sha256)
+            except Exception as _ce:
+                logger.warning(f"Scan cache okuma hatası: {_ce}")
 
-        # ── SilentNet imza ayrıştırma ──
-        silentnet = "[SILENTNET_DETECT]" in raw
-        github_hits = [l.replace("[GITHUB_PAYLOAD]", "").strip()
-                       for l in raw.splitlines() if "[GITHUB_PAYLOAD]" in l]
-        encrypted_hits = [l.replace("[ENCRYPTED_CLASS]", "").strip()
-                          for l in raw.splitlines() if "[ENCRYPTED_CLASS]" in l]
+        is_cache_hit = cached is not None
+        if is_cache_hit:
+            if tracker:
+                await tracker.stop()
+            raw = cached["raw_output"]
+            output = redact_urls(raw)
+            silentnet = cached["silentnet"]
+            all_payloads = cached["payloads"]
+            all_loaders  = cached["loaders"]
+            injection_hits = cached["injections"]
+            threat_score = cached["threat_score"]
+            verdict_str = cached["verdict"]
+        else:
+            ret, stdout, stderr = await run_engine("scan", inp)
+            if tracker:
+                await tracker.stop()
+
+            raw = stdout or stderr or ""
+            output = redact_urls(raw)
+
+            # ── SilentNet imza ayrıştırma (yeni + eski etiketler) ──
+            silentnet = "[SILENTNET_DETECT]" in raw
+
+            # Yeni etiketler (SuS Engine v4.5+)
+            payload_hits = [l.replace("[SILENTNET_PAYLOAD]", "").strip()
+                            for l in raw.splitlines() if "[SILENTNET_PAYLOAD]" in l]
+            loader_hits  = [l.replace("[SILENTNET_LOADER]", "").strip()
+                            for l in raw.splitlines() if "[SILENTNET_LOADER]" in l]
+            injection_hits = [l.replace("[MALICIOUS_INJECTION]", "").strip()
+                              for l in raw.splitlines() if "[MALICIOUS_INJECTION]" in l]
+
+            # Geriye dönük uyumluluk (eski etiketler)
+            github_hits = [l.replace("[GITHUB_PAYLOAD]", "").strip()
+                           for l in raw.splitlines() if "[GITHUB_PAYLOAD]" in l]
+            encrypted_hits = [l.replace("[ENCRYPTED_CLASS]", "").strip()
+                              for l in raw.splitlines() if "[ENCRYPTED_CLASS]" in l]
+
+            # Birleştir (tekrar olmasın)
+            all_payloads = list(dict.fromkeys(payload_hits + github_hits))
+            all_loaders  = list(dict.fromkeys(loader_hits + encrypted_hits))
+
+            # Threat score
+            threat_score_m = re.search(r"Threat Score\s*:\s*(\d+)/100", raw)
+            threat_score = int(threat_score_m.group(1)) if threat_score_m else 0
+            verdict_m = re.search(r"Verdict\s*:\s*(.+)", raw)
+            verdict_str = verdict_m.group(1).strip() if verdict_m else "Bilinmiyor"
+            classes_m = re.search(r"Scanned Classes\s*:\s*(\d+)", raw)
+            classes_count = int(classes_m.group(1)) if classes_m else 0
+
+            # DB'ye kaydet
+            if DB_AVAILABLE and file_sha256 and ret == 0:
+                try:
+                    await save_cached_scan(file_sha256, {
+                        "threat_score": threat_score,
+                        "verdict": verdict_str,
+                        "classes": classes_count,
+                        "silentnet": silentnet,
+                        "payloads": all_payloads,
+                        "loaders": all_loaders,
+                        "injections": injection_hits,
+                        "findings": [l.strip()[2:] for l in raw.splitlines() if l.strip().startswith("- ")],
+                        "raw_output": raw
+                    })
+                except Exception as _se:
+                    logger.warning(f"Scan cache kaydetme hatası: {_se}")
 
         if silentnet:
-            # Otomatik temizlik: github payload'u sil + fabric.mod.json onar
+            # Otomatik temizlik: payload'u sil + fabric.mod.json onar
             out = OUTPUT_DIR / f"{tid}_cleaned_{sname}"
             ret2, stdout2, stderr2 = await run_engine(
                 "clean", inp, out, "http://127.0.0.1:9999/cleaned_webhook")
             removed, fabric_fixed = 0, False
-            m = re.search(r"\[SILENTNET_CLEANED\]\s*removed=(\d+)\s*fabricPatched=(true|false)",
+            m_clean = re.search(r"\[SILENTNET_CLEANED\]\s*removed=(\d+)\s*fabricPatched=(true|false)",
                           stdout2 or "")
-            if m:
-                removed, fabric_fixed = int(m.group(1)), m.group(2) == "true"
+            if m_clean:
+                removed, fabric_fixed = int(m_clean.group(1)), m_clean.group(2) == "true"
 
-            e = mk_embed("🚨 SILENTNET DETECT — Zararlı Temizlendi",
-                         f"**`{sname[:100]}`** içinde SilentNet stealer payload'u tespit edildi ve etkisiz hale getirildi!",
+            # Temizlenen injection'lar
+            cleaned_injections = [l.replace("[CLEANED_INJECTION]", "").strip()
+                                  for l in (stdout2 or "").splitlines() if "[CLEANED_INJECTION]" in l]
+
+            cache_badge = " • ⚡ *[Önbellek]*" if is_cache_hit else ""
+            e = mk_embed("🚨 SILENTNET DETECT — Zararlı Tespit & Temizlendi",
+                         f"**`{sname[:100]}`** içinde **SilentNet stealer/RAT** payload'u tespit edildi ve etkisiz hale getirildi!{cache_badge}\n\n"
+                         f"🎯 **Tehdit Skoru:** `{threat_score}/100` — `{redact_urls(verdict_str[:80])}`",
                          DANGER_COLOR)
-            e.add_field(name="📁 Zararlı Klasör",
-                        value=f"`github/` — `{len(github_hits)}` girdi", inline=True)
-            e.add_field(name="🔒 Şifreli Class",
-                        value=f"`{len(encrypted_hits)}` adet", inline=True)
+
+            e.add_field(name="📁 Payload Dosyası",
+                        value=f"`{len(all_payloads)}` adet `.set`/payload", inline=True)
+            e.add_field(name="🔒 Loader/RAT Class",
+                        value=f"`{len(all_loaders)}` adet şifreli class", inline=True)
+            e.add_field(name="💉 Enjekte Hook",
+                        value=f"`{len(injection_hits)}` adet", inline=True)
             e.add_field(name="🧹 Temizlenen",
-                        value=f"`{removed}` dosya silindi", inline=True)
+                        value=f"`{removed}` tehdit kaldırıldı", inline=True)
             e.add_field(name="🧵 fabric.mod.json",
-                        value="✅ Onarıldı (github referansları temizlendi)" if fabric_fixed else "ℹ️ Değişiklik gerekmedi",
+                        value="✅ Onarıldı (zararlı referanslar temizlendi)" if fabric_fixed else "ℹ️ Değişiklik gerekmedi",
                         inline=True)
-            shown = [f"`{redact_urls(g)[:80]}`" for g in github_hits[:10]]
-            if len(github_hits) > 10:
-                shown.append(f"*+{len(github_hits) - 10} girdi daha…*")
-            if shown:
+            if cleaned_injections:
+                e.add_field(name="🔧 Temizlenen Hook",
+                            value=f"`{len(cleaned_injections)}` injection nötralize edildi", inline=True)
+
+            if all_payloads:
+                shown = [f"`{redact_urls(g)[:80]}`" for g in all_payloads[:8]]
+                if len(all_payloads) > 8:
+                    shown.append(f"*+{len(all_payloads) - 8} girdi daha…*")
                 e.add_field(name="🗑️ Silinen Payload", value="\n".join(shown)[:1000], inline=False)
-            shown_enc = [f"`{redact_urls(x)[:80]}`" for x in encrypted_hits[:10]]
-            if len(encrypted_hits) > 10:
-                shown_enc.append(f"*+{len(encrypted_hits) - 10} class daha…*")
-            if shown_enc:
-                e.add_field(name="🔐 Şifreli Classlar", value="\n".join(shown_enc)[:1000], inline=False)
+
+            if all_loaders:
+                shown_enc = [f"`{redact_urls(x)[:80]}`" for x in all_loaders[:8]]
+                if len(all_loaders) > 8:
+                    shown_enc.append(f"*+{len(all_loaders) - 8} class daha…*")
+                e.add_field(name="🔐 RAT/Loader Classlar", value="\n".join(shown_enc)[:1000], inline=False)
+
+            if injection_hits:
+                shown_inj = [f"`{redact_urls(x)[:80]}`" for x in injection_hits[:6]]
+                if len(injection_hits) > 6:
+                    shown_inj.append(f"*+{len(injection_hits) - 6} hook daha…*")
+                e.add_field(name="💉 Tespit Edilen Hooklar", value="\n".join(shown_inj)[:800], inline=False)
 
             if ret2 == 0 and out.exists() and out.stat().st_size <= 24.5 * 1024 * 1024:
                 dfile = discord.File(out, filename=f"cleaned_{sname}")
@@ -1518,7 +1697,7 @@ async def jarscanner(interaction: discord.Interaction, file: discord.Attachment)
                             inline=False)
                 await safe_followup(interaction, embed=e)
             else:
-                log = redact_urls((stdout2 + stderr2))[:800]
+                log = redact_urls((stdout2 or "") + (stderr2 or ""))[:800]
                 e.add_field(name="⚠️ Temizlik Notu",
                             value=f"Otomatik temizlik tamamlanamadı, `/jarclear` ile tekrar dene.\n```\n{log}\n```",
                             inline=False)
@@ -1526,8 +1705,10 @@ async def jarscanner(interaction: discord.Interaction, file: discord.Attachment)
             return
 
         has_threats = any(w in output for w in ("MALICIOUS", "HIGH RISK", "RAT", "STEAL", "CRITICAL", "HIGH", "SUSPICIOUS"))
-        color = DANGER_COLOR if has_threats else INFO_COLOR
-        e = mk_embed("🔍 SuS Scanner Raporu", f"`{sname[:100]}`", color)
+        color = DANGER_COLOR if has_threats else (0xFFA500 if threat_score >= 20 else INFO_COLOR)
+        title = "🔍 SuS Scanner — Şüpheli Tehditler" if has_threats else "✅ SuS Scanner — Temiz Görünüyor"
+        cache_badge = " • ⚡ *[Önbellek]*" if is_cache_hit else ""
+        e = mk_embed(title, f"`{sname[:100]}`\n🎯 **Tehdit Skoru:** `{threat_score}/100`{cache_badge}", color)
         chunks = [output[i:i+900] for i in range(0, min(len(output), 3600), 900)]
         for idx, chunk in enumerate(chunks[:4]):
             e.add_field(name=f"📋 Sonuç{' (devam)' if idx else ''}", value=f"```\n{chunk}\n```", inline=False)
@@ -1593,7 +1774,7 @@ async def jarclear(
             await tracker.stop()
 
         if ret != 0 or not out.exists():
-            log = redact_urls(stdout + stderr)[:1000]
+            log = redact_urls((stdout or "") + (stderr or ""))[:1000]
             return await safe_followup(interaction, f"❌ Temizleme hatası:\n```\n{log}\n```")
 
         # Parse exposed webhooks from stdout
@@ -1606,25 +1787,34 @@ async def jarclear(
 
         # Motor sayaçları (dürüst rapor için)
         purged, b64purged, susp_count, silent_count = 0, 0, 0, 0
-        m_purged = re.search(r"Threats Purged:\s*(\d+)", stdout)
+        inj_count, fabric_patched = 0, False
+        raw_out = stdout or ""
+        m_purged = re.search(r"Threats Purged:\s*(\d+)", raw_out)
         if m_purged:
             purged = int(m_purged.group(1))
-        m_b64 = re.search(r"Obfuscated \(Base64\) Neutralized:\s*(\d+)", stdout)
+        m_b64 = re.search(r"Obfuscated \(Base64\) Neutralized:\s*(\d+)", raw_out)
         if m_b64:
             b64purged = int(m_b64.group(1))
-        m_susp = re.search(r"Suspicious Methods:\s*(\d+)", stdout)
+        m_susp = re.search(r"Suspicious Methods:\s*(\d+)", raw_out)
         if m_susp:
             susp_count = int(m_susp.group(1))
-        m_sil = re.search(r"\[SILENTNET_CLEANED\]\s*removed=(\d+)", stdout)
+        m_sil = re.search(r"\[SILENTNET_CLEANED\]\s*removed=(\d+)\s*fabricPatched=(true|false)", raw_out)
         if m_sil:
             silent_count = int(m_sil.group(1))
+            fabric_patched = m_sil.group(2) == "true"
+        # Cerrahi enjeksiyon temizleme detayları
+        cleaned_injections = [l.replace("[CLEANED_INJECTION]", "").strip()
+                              for l in raw_out.splitlines() if "[CLEANED_INJECTION]" in l]
+        inj_count = len(cleaned_injections)
+        removed_silents = [l.replace("[SILENTNET_REMOVED]", "").strip()
+                           for l in raw_out.splitlines() if "[SILENTNET_REMOVED]" in l]
         susp_methods = [l.replace("[SUSPICIOUS_METHOD]", "").strip()
-                        for l in stdout.splitlines() if "[SUSPICIOUS_METHOD]" in l]
+                        for l in raw_out.splitlines() if "[SUSPICIOUS_METHOD]" in l]
 
         disp_name = safe_filename(file.filename)[:100]
 
         # Hiçbir şey bulunamadıysa sahte başarı yazma
-        if purged == 0 and silent_count == 0 and susp_count == 0:
+        if purged == 0 and silent_count == 0 and susp_count == 0 and inj_count == 0:
             e = mk_embed("✅ SuS Cleaner — Temiz Görünüyor",
                 f"**`{disp_name}`** tarandı, bilinen zararlı gösterge bulunamadı — işlem yapılmadı, jar aynen iletiliyor.",
                 SUCCESS_COLOR)
@@ -1635,14 +1825,21 @@ async def jarclear(
                 close_discord_files([dfile])
             return
 
+        desc_lines = [
+            f"**`{disp_name}`** dosyasındaki tehditler etkisiz hale getirildi!\n",
+            f"🎯 **Honeypot Hedefi:** `{redact_urls(target_hp)}`",
+            f"🧹 **Etkisiz Hale Getirilen:** `{purged}` tehdit" + (f" (`{b64purged}` Base64-gizli)" if b64purged else ""),
+        ]
+        if silent_count:
+            desc_lines.append(f"🗑️ **SilentNet Payload Silindi:** `{silent_count}` dosya")
+        if inj_count:
+            desc_lines.append(f"💉 **Enjekte Hook Temizlendi:** `{inj_count}` adet")
+        if fabric_patched:
+            desc_lines.append("🧵 **fabric.mod.json:** Zararlı referanslar temizlendi ✅")
+        if susp_count:
+            desc_lines.append(f"⚠️ **Şüpheli Metot:** `{susp_count}` (elle incele)")
         e = mk_embed("🧹 SuS Cleaner & Honeypot — Zararlı Kodlar Temizlendi",
-            f"**`{disp_name}`** dosyasındaki tehditler etkisiz hale getirildi ve güvenli hale getirildi!\n\n"
-            f"• **Honeypot Hedefi:** `{redact_urls(target_hp)}`\n"
-            f"• **Etkisiz Hale Getirilen:** `{purged}` tehdit"
-            + (f" (`{b64purged}` Base64-gizli)" if b64purged else "")
-            + (f"\n• **SilentNet Payload:** `{silent_count}` dosya silindi" if silent_count else "")
-            + (f"\n• **Şüpheli Metot:** `{susp_count}` (elle incele)" if susp_count else ""),
-            SUCCESS_COLOR)
+            "\n".join(desc_lines), SUCCESS_COLOR)
 
         # Webhook Honeypot Exposed Alert
         if exposed_webhooks:
@@ -1679,8 +1876,22 @@ async def jarclear(
                 except Exception:
                     pass
 
-        clean_log = redact_urls(stdout.strip())[-500:] if stdout.strip() else "Temizleme logu yok."
+        clean_log = redact_urls((stdout or "").strip())[-500:] if (stdout or "").strip() else "Temizleme logu yok."
         e.add_field(name="📋 Temizleme Raporu", value=f"```\n{clean_log}\n```", inline=False)
+
+        if removed_silents:
+            shown_rs = [f"`{redact_urls(s)[:80]}`" for s in removed_silents[:8]]
+            if len(removed_silents) > 8:
+                shown_rs.append(f"*+{len(removed_silents) - 8} daha…*")
+            e.add_field(name="🗑️ Silinen SilentNet Payload'ları",
+                        value="\n".join(shown_rs)[:1000], inline=False)
+
+        if cleaned_injections:
+            shown_ci = [f"`{redact_urls(s)[:80]}`" for s in cleaned_injections[:8]]
+            if len(cleaned_injections) > 8:
+                shown_ci.append(f"*+{len(cleaned_injections) - 8} hook daha…*")
+            e.add_field(name="💉 Cerrahi Olarak Temizlenen Hooklar",
+                        value="\n".join(shown_ci)[:1000], inline=False)
 
         if susp_methods:
             shown_s = [f"`{redact_urls(s)[:80]}`" for s in susp_methods[:10]]

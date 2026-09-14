@@ -74,6 +74,23 @@ async def init_db():
             )
         """)
 
+        # SHA-256 Tehdit Tarama Cache Tablosu
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS scan_cache (
+                sha256 TEXT PRIMARY KEY,
+                threat_score INTEGER NOT NULL,
+                verdict TEXT NOT NULL,
+                classes INTEGER NOT NULL,
+                silentnet INTEGER NOT NULL,
+                payloads_json TEXT NOT NULL,
+                loaders_json TEXT NOT NULL,
+                injections_json TEXT NOT NULL,
+                findings_json TEXT NOT NULL,
+                raw_output TEXT NOT NULL,
+                cached_at REAL NOT NULL
+            )
+        """)
+
         await db.commit()
 
     # Eski JSON verilerini SQLite'a taşı (migration)
@@ -258,3 +275,55 @@ async def check_and_increment_quota(user_id: str, max_daily: int = 5, is_vip: bo
         """, (user_id, date_str, new_ops))
         await db.commit()
         return True, new_ops
+
+# ─── SCAN CACHE METOTLARI ──────────────────────
+SCAN_CACHE_TTL = 86400  # 24 saat
+
+async def get_cached_scan(sha256: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT threat_score, verdict, classes, silentnet, payloads_json, loaders_json, injections_json, findings_json, raw_output, cached_at FROM scan_cache WHERE sha256 = ?",
+            (sha256,)
+        ) as cur:
+            row = await cur.fetchone()
+            if not row:
+                return None
+            cached_at = row[9]
+            if time.time() - cached_at > SCAN_CACHE_TTL:
+                await db.execute("DELETE FROM scan_cache WHERE sha256 = ?", (sha256,))
+                await db.commit()
+                return None
+            return {
+                "threat_score": row[0],
+                "verdict": row[1],
+                "classes": row[2],
+                "silentnet": bool(row[3]),
+                "payloads": json.loads(row[4]),
+                "loaders": json.loads(row[5]),
+                "injections": json.loads(row[6]),
+                "findings": json.loads(row[7]),
+                "raw_output": row[8],
+                "cached_at": cached_at
+            }
+
+async def save_cached_scan(sha256: str, data: dict):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT OR REPLACE INTO scan_cache 
+            (sha256, threat_score, verdict, classes, silentnet, payloads_json, loaders_json, injections_json, findings_json, raw_output, cached_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            sha256,
+            data.get("threat_score", 0),
+            data.get("verdict", "Bilinmiyor"),
+            data.get("classes", 0),
+            1 if data.get("silentnet") else 0,
+            json.dumps(data.get("payloads", [])),
+            json.dumps(data.get("loaders", [])),
+            json.dumps(data.get("injections", [])),
+            json.dumps(data.get("findings", [])),
+            data.get("raw_output", ""),
+            time.time()
+        ))
+        await db.commit()
+
