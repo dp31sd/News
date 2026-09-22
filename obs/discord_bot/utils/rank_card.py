@@ -46,17 +46,38 @@ async def create_rank_card(username: str, avatar_url: str, current_xp: int, need
 
     image.paste(avatar_img, avatar_pos, mask)
 
-    # 4. Text & Badges
-    try:
-        font_large = ImageFont.truetype("arial.ttf", 36)
-        font_mid   = ImageFont.truetype("arial.ttf", 26)
-        font_small = ImageFont.truetype("arial.ttf", 20)
-        font_bold  = ImageFont.truetype("arialbd.ttf", 40)
-    except Exception:
-        font_large = ImageFont.load_default()
-        font_mid   = ImageFont.load_default()
-        font_small = ImageFont.load_default()
-        font_bold  = ImageFont.load_default()
+    # 4. Text & Badges (Cross-platform Linux & Windows font loading)
+    def _get_font(size: int, bold: bool = False):
+        font_names = (
+            ["arialbd.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "segoeuib.ttf"]
+            if bold else
+            ["arial.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf", "segoeui.ttf"]
+        )
+        # Linux & Windows yaygın font yolları
+        search_paths = [
+            "",
+            "/usr/share/fonts/truetype/dejavu/",
+            "/usr/share/fonts/truetype/liberation/",
+            "/usr/share/fonts/truetype/msttcorefonts/",
+            "C:\\Windows\\Fonts\\",
+        ]
+        for path in search_paths:
+            for name in font_names:
+                try:
+                    full = f"{path}{name}" if path else name
+                    return ImageFont.truetype(full, size)
+                except Exception:
+                    continue
+        # Pillow 10+ load_default size destekler
+        try:
+            return ImageFont.load_default(size=size)
+        except Exception:
+            return ImageFont.load_default()
+
+    font_large = _get_font(36)
+    font_mid   = _get_font(26)
+    font_small = _get_font(20)
+    font_bold  = _get_font(40, bold=True)
 
     # Username
     display_user = username if len(username) <= 16 else username[:16] + "..."

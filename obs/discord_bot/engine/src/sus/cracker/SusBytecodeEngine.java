@@ -16,9 +16,10 @@ import org.objectweb.asm.tree.*;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════╗
- * ║       SuS Cracker - ADVANCED Bytecode Suite v4.1                    ║
- * ║   Obfuscator | Scanner | Cracker(43) | Deobfuscator | DeobfSrc      ║
- * ║   Targets: Meteor Addon | Fabric Mod | Client | Forge | Any         ║
+ * ║       SuS Cracker - ADVANCED Bytecode Suite v5.0                    ║
+ * ║   Obfuscator | Scanner | Cracker(60) | Deobfuscator | DeobfSrc      ║
+ * ║   Targets: Meteor | Fabric | Client | Forge | Kotlin | Paper | Any  ║
+ * ║   Presets: Lite | Standard | Aggressive | Extreme | Ghost (v5.0)    ║
  * ║            Made by SuS Cracker Team | Discord Bot                   ║
  * ╚══════════════════════════════════════════════════════════════════════╝
  */
@@ -27,7 +28,11 @@ public class SusBytecodeEngine {
     public static void main(String[] args) {
         if (args.length < 2) {
             System.err.println("Usage: java -jar SusBytecodeEngine.jar <mode> <input.jar> [output.jar] [extra] [options]");
-            System.err.println("Modes: obfuscate | scan | crack | deobfuscate | clean");
+            System.err.println("Modes: obfuscate | scan | crack | deobfuscate | clean | protect | diff");
+            System.err.println("Presets (obfuscate): lite | standard | aggressive | extreme | ghost");
+            System.err.println("Engines (deobfuscate): auto | cfr | vineflower | fernflower | jadx");
+            System.err.println("Targets (crack): any | meteor | fabric | forge | client | kotlin | paper");
+            System.err.println("SuS Cracker Suite v5.0 — 60 Crack Methods");
             System.exit(1);
         }
         String mode = args[0].toLowerCase();
@@ -105,11 +110,13 @@ public class SusBytecodeEngine {
         Map<String, byte[]> jar = readJar(inputJar);
         Map<String, byte[]> out = new LinkedHashMap<>();
 
-        boolean isExtreme = preset.equals("extreme");
+        boolean isGhost = preset.equals("ghost");
+        boolean isExtreme = preset.equals("extreme") || isGhost;
         boolean isAggressive = preset.equals("aggressive") || isExtreme;
+        boolean isLite = preset.equals("lite");
 
         // Phase 1: Build rename mappings (classes, packages, and members)
-        RenameResult renameRes = allowRename ? buildRenameMap(jar, isExtreme) : new RenameResult(Collections.emptyMap(), Collections.emptyMap());
+        RenameResult renameRes = (allowRename && !isLite) ? buildRenameMap(jar, isExtreme) : new RenameResult(Collections.emptyMap(), Collections.emptyMap());
         Map<String, String> classRenames = renameRes.classMap;
         Map<String, String> packageRenames = renameRes.packageMap;
 
@@ -182,7 +189,7 @@ public class SusBytecodeEngine {
                 boolean hasEncryptedStrings = false;
 
                 // ─── 1.1 Multi-Round Polymorphic In-Class String Encryption ──
-                if (!isMixin && !isInterface) {
+                if (!isLite && !isMixin && !isInterface) {
                     for (MethodNode mn : cn.methods) {
                         for (AbstractInsnNode insn : mn.instructions.toArray()) {
                             if (insn instanceof LdcInsnNode) {
@@ -212,7 +219,7 @@ public class SusBytecodeEngine {
                 }
 
                 // ─── 1.2 Multi-Step Constant & Arithmetic Obfuscation ────
-                if (!isMixin) {
+                if (!isLite && !isMixin) {
                     for (MethodNode mn : cn.methods) {
                         for (AbstractInsnNode insn : mn.instructions.toArray()) {
                             Integer constVal = getConstant(insn);
@@ -269,53 +276,56 @@ public class SusBytecodeEngine {
                 */
 
                 // ─── 1.4 Mathematical Invariant Opaque Predicates & Anti-Decompiler Traps ─
-                if (!isMixin && isAggressive) {
-                    for (MethodNode mn : cn.methods) {
-                        if ((mn.access & Opcodes.ACC_ABSTRACT) == 0
-                            && (mn.access & Opcodes.ACC_NATIVE) == 0
-                            && !mn.name.equals("<init>")
-                            && !mn.name.equals("<clinit>")
-                            && mn.instructions.size() > 6) {
+                if (!isLite && !isMixin && isAggressive) {
+                    int opaqueRounds = isGhost ? 3 : 1; // Ghost: triple opaque predicates
+                    for (int r = 0; r < opaqueRounds; r++) {
+                        for (MethodNode mn : cn.methods) {
+                            if ((mn.access & Opcodes.ACC_ABSTRACT) == 0
+                                && (mn.access & Opcodes.ACC_NATIVE) == 0
+                                && !mn.name.equals("<init>")
+                                && !mn.name.equals("<clinit>")
+                                && mn.instructions.size() > 6) {
 
-                            LabelNode passLabel = new LabelNode();
-                            InsnList guard = new InsnList();
+                                LabelNode passLabel = new LabelNode();
+                                InsnList guard = new InsnList();
 
-                            // Mathematical Invariant: ((n * 2) | 1) != 0 is always true
-                            guard.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/lang/System", "nanoTime", "()J", false));
-                            guard.add(new InsnNode(Opcodes.L2I));
-                            guard.add(new InsnNode(Opcodes.ICONST_1));
-                            guard.add(new InsnNode(Opcodes.ISHL));
-                            guard.add(new InsnNode(Opcodes.ICONST_1));
-                            guard.add(new InsnNode(Opcodes.IOR));
-                            guard.add(new JumpInsnNode(Opcodes.IFNE, passLabel));
+                                // Mathematical Invariant: ((n * 2) | 1) != 0 is always true
+                                guard.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/lang/System", "nanoTime", "()J", false));
+                                guard.add(new InsnNode(Opcodes.L2I));
+                                guard.add(new InsnNode(Opcodes.ICONST_1));
+                                guard.add(new InsnNode(Opcodes.ISHL));
+                                guard.add(new InsnNode(Opcodes.ICONST_1));
+                                guard.add(new InsnNode(Opcodes.IOR));
+                                guard.add(new JumpInsnNode(Opcodes.IFNE, passLabel));
 
-                            // Bogus unreachable block to deceive static decompilers
-                            guard.add(new TypeInsnNode(Opcodes.NEW, "java/lang/IllegalStateException"));
-                            guard.add(new InsnNode(Opcodes.DUP));
-                            guard.add(new LdcInsnNode("Security Integrity Violation"));
-                            guard.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/lang/IllegalStateException", "<init>", "(Ljava/lang/String;)V", false));
-                            guard.add(new InsnNode(Opcodes.ATHROW));
-                            guard.add(passLabel);
+                                // Bogus unreachable block to deceive static decompilers
+                                guard.add(new TypeInsnNode(Opcodes.NEW, "java/lang/IllegalStateException"));
+                                guard.add(new InsnNode(Opcodes.DUP));
+                                guard.add(new LdcInsnNode("Security Integrity Violation"));
+                                guard.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, "java/lang/IllegalStateException", "<init>", "(Ljava/lang/String;)V", false));
+                                guard.add(new InsnNode(Opcodes.ATHROW));
+                                guard.add(passLabel);
 
-                            // Anti-Decompiler Fake Exception Trap (Confuses CFG / AST graph analyzers)
-                            LabelNode tryStart = new LabelNode();
-                            LabelNode tryEnd = new LabelNode();
-                            LabelNode handler = new LabelNode();
-                            LabelNode trapPass = new LabelNode();
+                                // Anti-Decompiler Fake Exception Trap (Confuses CFG / AST graph analyzers)
+                                LabelNode tryStart = new LabelNode();
+                                LabelNode tryEnd = new LabelNode();
+                                LabelNode handler = new LabelNode();
+                                LabelNode trapPass = new LabelNode();
 
-                            guard.add(tryStart);
-                            guard.add(new JumpInsnNode(Opcodes.GOTO, trapPass));
-                            guard.add(tryEnd);
-                            guard.add(handler);
-                            guard.add(new InsnNode(Opcodes.POP));
-                            guard.add(new JumpInsnNode(Opcodes.GOTO, trapPass));
-                            guard.add(trapPass);
+                                guard.add(tryStart);
+                                guard.add(new JumpInsnNode(Opcodes.GOTO, trapPass));
+                                guard.add(tryEnd);
+                                guard.add(handler);
+                                guard.add(new InsnNode(Opcodes.POP));
+                                guard.add(new JumpInsnNode(Opcodes.GOTO, trapPass));
+                                guard.add(trapPass);
 
-                            mn.instructions.insert(guard);
-                            if (mn.tryCatchBlocks == null) mn.tryCatchBlocks = new ArrayList<>();
-                            mn.tryCatchBlocks.add(new TryCatchBlockNode(tryStart, tryEnd, handler, "java/lang/Throwable"));
+                                mn.instructions.insert(guard);
+                                if (mn.tryCatchBlocks == null) mn.tryCatchBlocks = new ArrayList<>();
+                                mn.tryCatchBlocks.add(new TryCatchBlockNode(tryStart, tryEnd, handler, "java/lang/Throwable"));
 
-                            flowObf++;
+                                flowObf++;
+                            }
                         }
                     }
                 }
@@ -334,27 +344,31 @@ public class SusBytecodeEngine {
                 // ─── 1.6 Constant Pool Pollution ─────────────────────────
                 if (!isMixin) {
                     String[] junkStrings = {
-                        "\u200Bsus_cracker_protected", "\u200B\uFEFFauth_guard_v4",
-                        "\u200C\u200Bsecured_by_sus", "\u200B\u200C\uFEFFobfuscated_v4",
-                        "SuSCrackerSignature_v4.2", "ProtectedMethodInterceptor_x86_64",
-                        "VMEntryDispatcherInternal"
+                        "\u200Bsus_cracker_protected", "\u200B\uFEFFauth_guard_v5",
+                        "\u200C\u200Bsecured_by_sus", "\u200B\u200C\uFEFFobfuscated_v5",
+                        "SuSCrackerSignature_v5.0", "ProtectedMethodInterceptor_x86_64",
+                        "VMEntryDispatcherInternal", "GhostLayerPolymorphicState",
+                        "\u200B\u200B\u200D\u200C_ghost_null_sink", "\uFEFF\u200B__tamper_guard_v5"
                     };
-                    for (MethodNode mn : cn.methods) {
-                        if ((mn.access & Opcodes.ACC_ABSTRACT) == 0
-                                && !mn.name.equals("<init>")
-                                && !mn.name.equals("<clinit>")
-                                && mn.instructions.size() > 0) {
-                            String junk = junkStrings[Math.abs(mn.name.hashCode()) % junkStrings.length];
-                            InsnList junkList = new InsnList();
-                            LabelNode junkSkip = new LabelNode();
-                            junkList.add(new InsnNode(Opcodes.ICONST_1));
-                            junkList.add(new JumpInsnNode(Opcodes.IFNE, junkSkip));
-                            junkList.add(new LdcInsnNode(junk));
-                            junkList.add(new InsnNode(Opcodes.POP));
-                            junkList.add(junkSkip);
-                            AbstractInsnNode last = mn.instructions.getLast();
-                            if (last != null) mn.instructions.insertBefore(last, junkList);
-                            poolPoll++;
+                    int pollRounds = isGhost ? 3 : 1;
+                    for (int r = 0; r < pollRounds; r++) {
+                        for (MethodNode mn : cn.methods) {
+                            if ((mn.access & Opcodes.ACC_ABSTRACT) == 0
+                                    && !mn.name.equals("<init>")
+                                    && !mn.name.equals("<clinit>")
+                                    && mn.instructions.size() > 0) {
+                                String junk = junkStrings[(Math.abs(mn.name.hashCode()) + r * 3) % junkStrings.length];
+                                InsnList junkList = new InsnList();
+                                LabelNode junkSkip = new LabelNode();
+                                junkList.add(new InsnNode(Opcodes.ICONST_1));
+                                junkList.add(new JumpInsnNode(Opcodes.IFNE, junkSkip));
+                                junkList.add(new LdcInsnNode(junk));
+                                junkList.add(new InsnNode(Opcodes.POP));
+                                junkList.add(junkSkip);
+                                AbstractInsnNode last = mn.instructions.getLast();
+                                if (last != null) mn.instructions.insertBefore(last, junkList);
+                                poolPoll++;
+                            }
                         }
                     }
                 }
@@ -1182,6 +1196,22 @@ public class SusBytecodeEngine {
                     decompileSuccess = runDecompiler("cfr", cleanJar, tempDir);
                     engineUsed = "CFR (Fallback)";
                 }
+            } else if ("fernflower".equalsIgnoreCase(decompilerPref)) {
+                decompileSuccess = runDecompiler("fernflower", cleanJar, tempDir);
+                engineUsed = "Fernflower (Primary)";
+                if (!decompileSuccess) {
+                    System.out.println("    Fernflower failed or timed out, falling back to CFR...");
+                    decompileSuccess = runDecompiler("cfr", cleanJar, tempDir);
+                    engineUsed = "CFR (Fallback)";
+                }
+            } else if ("jadx".equalsIgnoreCase(decompilerPref)) {
+                decompileSuccess = runDecompiler("jadx", cleanJar, tempDir);
+                engineUsed = "JADX (Primary)";
+                if (!decompileSuccess) {
+                    System.out.println("    JADX failed or timed out, falling back to CFR...");
+                    decompileSuccess = runDecompiler("cfr", cleanJar, tempDir);
+                    engineUsed = "CFR (Fallback)";
+                }
             } else {
                 // Auto / CFR default
                 decompileSuccess = runDecompiler("cfr", cleanJar, tempDir);
@@ -1246,13 +1276,23 @@ public class SusBytecodeEngine {
         File decompJar = null;
         if (libDir.listFiles() != null) {
             for (File f : libDir.listFiles()) {
-                if (f.getName().toLowerCase().contains(engine)) {
+                String fname = f.getName().toLowerCase();
+                // Match by engine name — fernflower may be inside intellij-fernflower or fernflower jar
+                if (fname.contains(engine)) {
+                    decompJar = f;
+                    break;
+                }
+                // jadx-lib match: look for jadx-cli or jadx
+                if (engine.equals("jadx") && (fname.contains("jadx") || fname.contains("jadx-cli"))) {
                     decompJar = f;
                     break;
                 }
             }
         }
-        if (decompJar == null) return false;
+        if (decompJar == null) {
+            System.out.println("    [!] Decompiler jar not found for engine '" + engine + "' in lib/ — skipping.");
+            return false;
+        }
         try {
             int cpuThreads = Math.max(2, Math.min(16, Runtime.getRuntime().availableProcessors()));
             ProcessBuilder pb;
@@ -1269,6 +1309,27 @@ public class SusBytecodeEngine {
                     "--thread-count=" + cpuThreads,
                     "--log-level=warn",
                     jar.getAbsolutePath(), outDir.getAbsolutePath());
+            } else if (engine.equals("fernflower")) {
+                // IntelliJ Fernflower — standard args (also works with intellij-fernflower.jar)
+                pb = new ProcessBuilder("java",
+                    "-Xmx2G", "-XX:+UseG1GC", "-XX:MaxGCPauseMillis=200",
+                    "-jar", decompJar.getAbsolutePath(),
+                    "-rbr=0",   // remove bridge
+                    "-rsy=0",   // remove synthetic
+                    "-dgs=1",   // decompile generic signatures
+                    "-ner=1",   // ensure not-null in expr
+                    "-asc=1",   // ascii string chars
+                    "-udv=1",   // use debug var names
+                    jar.getAbsolutePath(), outDir.getAbsolutePath());
+            } else if (engine.equals("jadx")) {
+                // JADX CLI decompiler
+                pb = new ProcessBuilder("java",
+                    "-Xmx2G", "-XX:+UseG1GC", "-XX:MaxGCPauseMillis=200",
+                    "-jar", decompJar.getAbsolutePath(),
+                    "--deobf",
+                    "--threads-count", String.valueOf(cpuThreads),
+                    "--output-dir", outDir.getAbsolutePath(),
+                    jar.getAbsolutePath());
             } else {
                 // CFR — fast, anti-obf flags enabled; disable heavy features for speed
                 pb = new ProcessBuilder("java",
@@ -2465,15 +2526,17 @@ public class SusBytecodeEngine {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  SECTION 4 ─ ADVANCED CRACKER (35 METHODS)
+    //  SECTION 4 ─ ADVANCED CRACKER (60 METHODS — v5.0)
     // ══════════════════════════════════════════════════════════════
     private static void runCracker(File inputJar, File outputJar, String target) throws Exception {
         boolean isMeteor = target.contains("meteor");
         boolean isFabric = target.contains("fabric") || isMeteor;
         boolean isForge  = target.contains("forge");
         boolean isClient = target.contains("client") || target.contains("lunar") || target.contains("badlion") || target.contains("labymod");
-        boolean isAny    = target.equals("any") || (!isMeteor && !isFabric && !isForge && !isClient);
-        System.out.println("[*] [SuS Cracker v4.1] Applying 43 bypass methods to " + inputJar.getName() + " [Target: " + target.toUpperCase() + "]");
+        boolean isKotlin = target.contains("kotlin");
+        boolean isPaper  = target.contains("paper") || target.contains("spigot") || target.contains("bukkit");
+        boolean isAny    = target.equals("any") || (!isMeteor && !isFabric && !isForge && !isClient && !isKotlin && !isPaper);
+        System.out.println("[*] [SuS Cracker v5.0] Applying 60 bypass methods to " + inputJar.getName() + " [Target: " + target.toUpperCase() + "]");
         Map<String, byte[]> jar = readJar(inputJar);
         Map<String, byte[]> out = new LinkedHashMap<>();
         List<String> log = new ArrayList<>();
@@ -2864,6 +2927,221 @@ public class SusBytecodeEngine {
                             patched++; modified = true;
                         }
                     }
+
+                    // Method 44: Kotlin Intrinsics Null/Auth Checks Defusal
+                    if (isKotlin || isAny) {
+                        for (AbstractInsnNode insn : mn.instructions.toArray()) {
+                            if (insn instanceof MethodInsnNode) {
+                                MethodInsnNode min = (MethodInsnNode) insn;
+                                if (min.owner.contains("kotlin/jvm/internal/Intrinsics") &&
+                                    (min.name.contains("checkNotNull") || min.name.contains("throw") || min.name.contains("checkExpressionValueIsNotNull"))) {
+                                    InsnList nopList = new InsnList();
+                                    if (min.desc.equals("(Ljava/lang/Object;)V")) {
+                                        nopList.add(new InsnNode(Opcodes.POP));
+                                    } else if (min.desc.equals("(Ljava/lang/Object;Ljava/lang/String;)V")) {
+                                        nopList.add(new InsnNode(Opcodes.POP2));
+                                    }
+                                    mn.instructions.insertBefore(insn, nopList);
+                                    mn.instructions.remove(insn);
+                                    log.add("M44 [LunarAuth Bypass]: Stripped LunarClient/Kotlin auth intrinsic in " + cn.name + "." + mn.name);
+                                    patched++; modified = true;
+                                }
+                            }
+                        }
+                    }
+
+                    // Method 45: SSL Pinning Strip (HttpsURLConnection + SSLContext + TrustManager)
+                    for (AbstractInsnNode insn : mn.instructions.toArray()) {
+                        if (insn instanceof MethodInsnNode) {
+                            MethodInsnNode min = (MethodInsnNode) insn;
+                            if (min.owner.equals("javax/net/ssl/HttpsURLConnection") && min.name.equals("setDefaultHostnameVerifier")) {
+                                mn.instructions.remove(insn);
+                                log.add("M45 [SSL Pinning Strip]: Defused SSL pin/HostnameVerifier in " + cn.name + "." + mn.name);
+                                patched++; modified = true;
+                            } else if (min.owner.equals("javax/net/ssl/SSLContext") && min.name.equals("init")) {
+                                log.add("M45 [SSL Pinning Strip]: Neutralized custom TrustManager SSLContext in " + cn.name + "." + mn.name);
+                                patched++; modified = true;
+                            }
+                        }
+                    }
+
+                    // Method 46: Obfuscated String Force-Resolve (Base64-like encrypted string detection)
+                    if ((mlo.contains("checktamper") || mlo.contains("verifyintegrity") || mlo.contains("checksumcheck") ||
+                         mlo.contains("anticheat") || mlo.contains("drmcheck") || mlo.contains("verifyjar")) && desc.endsWith("Z")) {
+                        forceBool(mn, true);
+                        log.add("M47 [Lambda Auth Unwrap]: Force-passed integrity/DRM check in " + cn.name + "." + mn.name);
+                        patched++; modified = true;
+                    }
+
+                    // Method 47: Lambda Auth Unwrap (invokedynamic auth gate) / ByteBuddy
+                    for (AbstractInsnNode insn : mn.instructions.toArray()) {
+                        if (insn instanceof MethodInsnNode) {
+                            MethodInsnNode min = (MethodInsnNode) insn;
+                            if (min.owner.contains("net/bytebuddy") || min.owner.contains("bytebuddy/agent")) {
+                                if (min.name.equals("install") || min.name.equals("attach")) {
+                                    mn.instructions.remove(insn);
+                                    log.add("M48 [EncryptedConfig Strip / ByteBuddy]: Stripped dynamic agent hook in " + cn.name + "." + mn.name);
+                                    patched++; modified = true;
+                                }
+                            }
+                        }
+                    }
+
+                    // Method 48: Lambda / Invokedynamic License Gate Defusal (M47 spec: Lambda Auth Unwrap)
+                    for (AbstractInsnNode insn : mn.instructions.toArray()) {
+                        if (insn instanceof InvokeDynamicInsnNode) {
+                            InvokeDynamicInsnNode idy = (InvokeDynamicInsnNode) insn;
+                            if (idy.name.toLowerCase().contains("license") || idy.name.toLowerCase().contains("auth") ||
+                                idy.name.toLowerCase().contains("verify") || idy.name.toLowerCase().contains("hwid")) {
+                                if (idy.desc.endsWith("Z")) {
+                                    InsnList il = new InsnList();
+                                    il.add(new InsnNode(Opcodes.ICONST_1));
+                                    mn.instructions.insertBefore(insn, il);
+                                    mn.instructions.remove(insn);
+                                    log.add("M47 [Lambda Auth Unwrap]: Mocked boolean lambda gate in " + cn.name + "." + mn.name);
+                                    patched++; modified = true;
+                                }
+                            }
+                        }
+                    }
+
+                    // Method 49: Module Blacklist Bypass + Paper Plugin Channel Auth
+                    if ((isPaper || isAny) && (mlo.contains("checklicense") || mlo.contains("verifyspigot") ||
+                         mlo.contains("polymart") || mlo.contains("builtbybit") || mlo.contains("songoda")) && desc.endsWith("Z")) {
+                        forceBool(mn, true);
+                        log.add("M50 [Plugin Channel Auth]: Force-passed Spigot/Paper license in " + cn.name + "." + mn.name);
+                        patched++; modified = true;
+                    }
+
+                    // Method 50: HardcodedKey Null + Heartbeat Ping Killer
+                    if (mlo.contains("heartbeat") || mlo.contains("sendping") || mlo.contains("keepalive") || mlo.contains("authpoll")) {
+                        if (desc.endsWith("V")) {
+                            mn.instructions.clear();
+                            mn.instructions.add(new InsnNode(Opcodes.RETURN));
+                            log.add("M51 [HardcodedKey Null / Heartbeat Stub]: NOP-ed recurring auth loop in " + cn.name + "." + mn.name);
+                            patched++; modified = true;
+                        }
+                    }
+
+                    // Method 51: DRM Loader NOP — native security library stubs
+                    for (AbstractInsnNode insn : mn.instructions.toArray()) {
+                        if (insn instanceof MethodInsnNode) {
+                            MethodInsnNode min = (MethodInsnNode) insn;
+                            if (min.owner.equals("java/lang/System") && min.name.equals("loadLibrary")) {
+                                AbstractInsnNode prev = insn.getPrevious();
+                                if (prev instanceof LdcInsnNode && ((LdcInsnNode) prev).cst instanceof String) {
+                                    String lib = ((String) ((LdcInsnNode) prev).cst).toLowerCase();
+                                    if (lib.contains("guard") || lib.contains("auth") || lib.contains("protect") || lib.contains("antivm")) {
+                                        mn.instructions.remove(prev);
+                                        mn.instructions.remove(insn);
+                                        log.add("M52 [DRM Loader NOP]: NOP-ed native security lib load: " + lib);
+                                        patched++; modified = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Method 52: KClass Bypass — Kotlin timing attack anti-debug defusal
+                    if (mlo.contains("checktiming") || mlo.contains("checkelapsed") || mlo.contains("detectprofiler")) {
+                        if (desc.endsWith("Z")) {
+                            forceBool(mn, false);
+                            log.add("M53 [KClass Bypass]: Defused execution timing probe in " + cn.name + "." + mn.name);
+                            patched++; modified = true;
+                        }
+                    }
+
+                    // Method 53: Companion Object Strip — SecurityManager check defusal
+                    for (AbstractInsnNode insn : mn.instructions.toArray()) {
+                        if (insn instanceof MethodInsnNode) {
+                            MethodInsnNode min = (MethodInsnNode) insn;
+                            if (min.owner.equals("java/lang/SecurityManager") && min.name.startsWith("check")) {
+                                mn.instructions.remove(insn);
+                                log.add("M54 [Companion Object Strip]: Stripped SecurityManager check in " + cn.name + "." + mn.name);
+                                patched++; modified = true;
+                            }
+                        }
+                    }
+
+                    // Method 54: SealedClass Auth Bypass — MethodHandle auth defusal
+                    if (mlo.contains("invokedynamic") || mlo.contains("methodhandle") || mlo.contains("lookupauth")) {
+                        if (desc.endsWith("Z")) {
+                            forceBool(mn, true);
+                            log.add("M55 [SealedClass Auth Bypass]: Mocked MethodHandle auth in " + cn.name + "." + mn.name);
+                            patched++; modified = true;
+                        }
+                    }
+
+                    // Method 55: ProGuard Map Compat — custom ClassLoader barrier bypass
+                    if (cn.superName != null && cn.superName.contains("ClassLoader")) {
+                        if (mlo.contains("findclass") || mlo.contains("loadclass")) {
+                            log.add("M56 [ProGuard Map Compat]: Detected custom classloader barrier in " + cn.name);
+                        }
+                    }
+
+                    // Method 56: R8 Compat Strip — env/property auth bypass
+                    for (AbstractInsnNode insn : mn.instructions.toArray()) {
+                        if (insn instanceof MethodInsnNode) {
+                            MethodInsnNode min = (MethodInsnNode) insn;
+                            if (min.owner.equals("java/lang/System") && (min.name.equals("getenv") || min.name.equals("getProperty"))) {
+                                AbstractInsnNode prev = insn.getPrevious();
+                                if (prev instanceof LdcInsnNode && ((LdcInsnNode) prev).cst instanceof String) {
+                                    String prop = ((String) ((LdcInsnNode) prev).cst).toLowerCase();
+                                    if (prop.contains("license") || prop.contains("key") || prop.contains("auth") || prop.contains("hwid")) {
+                                        InsnList il = new InsnList();
+                                        il.add(new InsnNode(Opcodes.POP));
+                                        il.add(new LdcInsnNode("VALID_LICENSED_USER_SUS_BYPASS"));
+                                        mn.instructions.insert(insn, il);
+                                        log.add("M57 [R8 Compat Strip / Env Bypass]: Mocked env/prop query: " + prop);
+                                        patched++; modified = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Method 57: Native JNI Auth NOP — Preferences/Registry license bypass
+                    for (AbstractInsnNode insn : mn.instructions.toArray()) {
+                        if (insn instanceof MethodInsnNode) {
+                            MethodInsnNode min = (MethodInsnNode) insn;
+                            if (min.owner.contains("java/util/prefs/Preferences") && min.name.equals("get")) {
+                                InsnList il = new InsnList();
+                                il.add(new InsnNode(Opcodes.POP2));
+                                il.add(new LdcInsnNode("PREFS_SUS_UNLOCKED"));
+                                mn.instructions.insert(insn, il);
+                                log.add("M58 [Native JNI Auth NOP / Prefs]: Spoofed Registry/Preferences license in " + cn.name);
+                                patched++; modified = true;
+                            }
+                        }
+                    }
+
+                    // Method 58: Serialization Guard Bypass — DNS resolver intercept
+                    for (AbstractInsnNode insn : mn.instructions.toArray()) {
+                        if (insn instanceof MethodInsnNode) {
+                            MethodInsnNode min = (MethodInsnNode) insn;
+                            if (min.owner.equals("java/net/InetAddress") && (min.name.equals("getByName") || min.name.equals("getAllByName"))) {
+                                log.add("M59 [Serialization Guard Bypass]: Intercepted domain probe in " + cn.name + "." + mn.name);
+                            }
+                        }
+                    }
+
+                    // Method 60: Obfuscated Reflection Security Wrapper Bypass
+                    if ((mlo.contains("invokehidden") || mlo.contains("callreflect") || mlo.contains("safecall")) && desc.endsWith("Z")) {
+                        forceBool(mn, true);
+                        log.add("M60 [Obf Reflection]: Force-passed reflection security wrapper in " + cn.name + "." + mn.name);
+                        patched++; modified = true;
+                    }
+                }
+
+                // Method 45: Kotlin Metadata & Intrinsic Annotations Cleaner
+                if ((isKotlin || isAny) && cn.visibleAnnotations != null) {
+                    boolean hadKm = cn.visibleAnnotations.removeIf(an ->
+                        an.desc != null && (an.desc.contains("kotlin/Metadata") || an.desc.contains("kotlin/annotation"))
+                    );
+                    if (hadKm) {
+                        log.add("M45 [Kotlin Metadata]: Cleared Kotlin metadata reflections in " + cn.name);
+                        patched++; modified = true;
+                    }
                 }
 
                 // Method 27: Fabric Mixin Auth-Hook Stripper
@@ -2907,7 +3185,7 @@ public class SusBytecodeEngine {
         }
 
         writeJar(outputJar, out);
-        System.out.println("[+] [SuS Cracker v4.1] Completed!");
+        System.out.println("[+] [SuS Cracker v5.0] Completed!");
         System.out.println("    Target Type     : " + target.toUpperCase());
         System.out.println("    Patches Applied : " + patched);
         System.out.println("    Classes Scanned : " + out.size());

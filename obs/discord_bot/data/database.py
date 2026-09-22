@@ -10,10 +10,15 @@ DB_PATH  = DATA_DIR / "bot_database.db"
 
 DATA_DIR.mkdir(exist_ok=True)
 
+def get_db():
+    """ aiolsite baglantisini 30sn busy_timeout ile donduren guvenli helper """
+    return aiosqlite.connect(DB_PATH, timeout=30.0)
+
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute("PRAGMA journal_mode = WAL")
         await db.execute("PRAGMA synchronous = NORMAL")
+        await db.execute("PRAGMA busy_timeout = 30000")
 
         # XP & Seviye Tablosu
         await db.execute("""
@@ -103,7 +108,7 @@ async def _migrate_legacy_json():
         try:
             with open(xp_file, encoding="utf-8") as f:
                 data = json.load(f)
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with get_db() as db:
                 for uid, d in data.items():
                     await db.execute("""
                         INSERT OR IGNORE INTO users_xp (user_id, xp, level, last_xp)
@@ -119,7 +124,7 @@ async def _migrate_legacy_json():
         try:
             with open(afk_file, encoding="utf-8") as f:
                 data = json.load(f)
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with get_db() as db:
                 for uid, d in data.items():
                     await db.execute("""
                         INSERT OR IGNORE INTO afk (user_id, reason, timestamp)
@@ -131,7 +136,7 @@ async def _migrate_legacy_json():
 
 # ─── XP / RANK METOTLARI ──────────────────────
 async def get_user_xp(user_id: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         async with db.execute("SELECT xp, level, last_xp FROM users_xp WHERE user_id = ?", (user_id,)) as cur:
             row = await cur.fetchone()
             if row:
@@ -139,7 +144,7 @@ async def get_user_xp(user_id: str):
             return {"xp": 0, "level": 1, "last_xp": 0}
 
 async def add_user_xp(user_id: str, amount: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         user = await get_user_xp(user_id)
         new_xp = user["xp"] + amount
         new_level = user["level"]
@@ -165,7 +170,7 @@ async def add_user_xp(user_id: str, amount: int):
         return leveled_up, new_level, new_xp
 
 async def get_leaderboard_data(limit: int = 10, offset: int = 0):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         async with db.execute("""
             SELECT user_id, xp, level FROM users_xp
             ORDER BY level DESC, xp DESC
@@ -179,7 +184,7 @@ async def get_leaderboard_data(limit: int = 10, offset: int = 0):
         return rows, total_count
 
 async def get_user_rank_position(user_id: str) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         async with db.execute("""
             SELECT COUNT(*) FROM users_xp
             WHERE (level > (SELECT level FROM users_xp WHERE user_id = ?))
@@ -191,7 +196,7 @@ async def get_user_rank_position(user_id: str) -> int:
 
 # ─── AFK METOTLARI ─────────────────────────────
 async def get_afk(user_id: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         async with db.execute("SELECT reason, timestamp FROM afk WHERE user_id = ?", (user_id,)) as cur:
             row = await cur.fetchone()
             if row:
@@ -199,7 +204,7 @@ async def get_afk(user_id: str):
             return None
 
 async def set_afk(user_id: str, reason: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute("""
             INSERT OR REPLACE INTO afk (user_id, reason, timestamp)
             VALUES (?, ?, ?)
@@ -207,13 +212,13 @@ async def set_afk(user_id: str, reason: str):
         await db.commit()
 
 async def remove_afk(user_id: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute("DELETE FROM afk WHERE user_id = ?", (user_id,))
         await db.commit()
 
 # ─── WARN METOTLARI ────────────────────────────
 async def add_warn(user_id: str, reason: str, moderator: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute("""
             INSERT INTO warns (user_id, reason, moderator, timestamp)
             VALUES (?, ?, ?, ?)
@@ -223,18 +228,18 @@ async def add_warn(user_id: str, reason: str, moderator: str):
             return (await cur.fetchone())[0]
 
 async def get_warns(user_id: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         async with db.execute("SELECT id, reason, moderator, timestamp FROM warns WHERE user_id = ? ORDER BY id ASC", (user_id,)) as cur:
             return await cur.fetchall()
 
 async def clear_warns(user_id: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute("DELETE FROM warns WHERE user_id = ?", (user_id,))
         await db.commit()
 
 # ─── TICKET METOTLARI ──────────────────────────
 async def add_ticket(channel_id: str, user_id: str, category: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute("""
             INSERT OR REPLACE INTO tickets (channel_id, user_id, category, opened_at)
             VALUES (?, ?, ?, ?)
@@ -242,7 +247,7 @@ async def add_ticket(channel_id: str, user_id: str, category: str):
         await db.commit()
 
 async def get_ticket(channel_id: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         async with db.execute("SELECT user_id, category, opened_at FROM tickets WHERE channel_id = ?", (channel_id,)) as cur:
             row = await cur.fetchone()
             if row:
@@ -250,7 +255,7 @@ async def get_ticket(channel_id: str):
             return None
 
 async def remove_ticket(channel_id: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute("DELETE FROM tickets WHERE channel_id = ?", (channel_id,))
         await db.commit()
 
@@ -259,7 +264,7 @@ async def check_and_increment_quota(user_id: str, max_daily: int = 5, is_vip: bo
     if is_vip:
         return True, 999
     date_str = time.strftime("%Y-%m-%d")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         async with db.execute("SELECT ops_count FROM user_quotas WHERE user_id = ? AND date_str = ?", (user_id, date_str)) as cur:
             row = await cur.fetchone()
             current_ops = row[0] if row else 0
@@ -280,7 +285,7 @@ async def check_and_increment_quota(user_id: str, max_daily: int = 5, is_vip: bo
 SCAN_CACHE_TTL = 86400  # 24 saat
 
 async def get_cached_scan(sha256: str) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         async with db.execute(
             "SELECT threat_score, verdict, classes, silentnet, payloads_json, loaders_json, injections_json, findings_json, raw_output, cached_at FROM scan_cache WHERE sha256 = ?",
             (sha256,)
@@ -307,7 +312,7 @@ async def get_cached_scan(sha256: str) -> dict | None:
             }
 
 async def save_cached_scan(sha256: str, data: dict):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute("""
             INSERT OR REPLACE INTO scan_cache 
             (sha256, threat_score, verdict, classes, silentnet, payloads_json, loaders_json, injections_json, findings_json, raw_output, cached_at)

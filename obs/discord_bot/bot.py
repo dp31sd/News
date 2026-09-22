@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 # ─── Utility Modülleri ────────────────────────
@@ -156,6 +156,151 @@ def mk_embed(title: str, desc: str = "", color: int = BRAND_COLOR, *, footer: bo
         e.set_footer(text=FOOTER_TEXT)
     return e
 
+
+def mk_jar_embed(
+    *,
+    title: str,
+    color: int = BRAND_COLOR,
+    filename: str = "",
+    elapsed: float = 0.0,
+    desc_extra: str = "",
+    mod_name: str = "",
+    size_str: str = "",
+    loader: str = "",
+    class_count: str = "—",
+    pkg_count: str = "—",
+    main_class: str = "N/A",
+    sha256: str = "",
+    output_filename: str = "",
+    uuid_str: str = "",
+    jvm_params: str = "-Xms256m -Xmx2G -Xss4M -XX:+UseG1GC",
+) -> discord.Embed:
+    """Referans ekrandaki 'Analiz Tamamlandı' tarzı professional JAR embed üretir."""
+    desc_lines = []
+    if filename:
+        desc_lines.append(f"**{filename}** işlemi tamamlandı. ⏱️ `{elapsed}s`")
+    if desc_extra:
+        desc_lines.append(desc_extra)
+    if output_filename:
+        desc_lines.append(f"Aşağıya ZIP + rapor dosyaları eklenmiştir.")
+    desc = "\n".join(desc_lines)
+    e = discord.Embed(title=title, description=desc, color=color, timestamp=discord.utils.utcnow())
+
+    # Row 1: Mod Adı | Boyut | Loader
+    e.add_field(name="📁 Mod Adı",  value=f"`{mod_name or (filename[:30] if filename else '—')}`", inline=True)
+    e.add_field(name="📏 Boyut",    value=f"`{size_str or '—'}`",  inline=True)
+    e.add_field(name="🔧 Loader",   value=f"`{loader or '—'}`",    inline=True)
+
+    # Row 2: Sınıf Sayısı | Paket Sayısı | Main-Class
+    e.add_field(name="📊 Sınıf Sayısı",  value=f"`{class_count}`", inline=True)
+    e.add_field(name="📦 Paket Sayısı",  value=f"`{pkg_count}`",   inline=True)
+    e.add_field(name="🌐 Main-Class",    value=f"`{main_class}`",  inline=True)
+
+    # Output filename
+    if output_filename:
+        e.add_field(name="📤 Çıktı Arşivi", value=f"`{output_filename}`", inline=False)
+
+    # SHA-256
+    if sha256:
+        trunc = sha256[:24] + "…" + sha256[-8:] if len(sha256) > 32 else sha256
+        e.add_field(name="🔒 SHA-256", value=f"`{trunc}`", inline=False)
+
+    # JVM Parametreleri
+    e.add_field(name="⚡ JVM Parametreleri", value=f"`{jvm_params}`", inline=False)
+
+    # İşlem UUID
+    if uuid_str:
+        e.add_field(name="🆔 İşlem UUID", value=f"`{uuid_str}`", inline=False)
+
+    e.set_footer(text=FOOTER_TEXT)
+    return e
+
+
+def parse_jar_meta(jar_path) -> dict:
+    """JAR dosyasından metadata okur: mod adı, loader, sınıf/paket sayısı, Main-Class."""
+    meta = {"mod_name": "—", "loader": "—", "class_count": "—", "pkg_count": "—", "main_class": "N/A"}
+    try:
+        with zipfile.ZipFile(jar_path, "r") as zf:
+            names = zf.namelist()
+            classes = [n for n in names if n.endswith(".class") and not n.startswith("META-INF")]
+            pkgs = {n.rsplit("/", 1)[0] for n in classes if "/" in n}
+            meta["class_count"] = str(len(classes))
+            meta["pkg_count"]   = str(len(pkgs))
+
+            # Loader detection
+            has_fabric  = "fabric.mod.json" in names
+            has_forge   = any("mods.toml" in n or "mcmod.info" in n for n in names)
+            has_quilt   = "quilt.mod.json" in names
+            has_meteor  = any("meteor" in n.lower() for n in names)
+            has_paper   = any("plugin.yml" in n for n in names)
+            has_kotlin  = any("kotlin/" in n for n in names)
+            if has_quilt:
+                meta["loader"] = "Quilt"
+            elif has_fabric:
+                meta["loader"] = "Fabric"
+            elif has_forge:
+                meta["loader"] = "Forge"
+            elif has_meteor:
+                meta["loader"] = "Meteor"
+            elif has_paper:
+                meta["loader"] = "Paper/Spigot"
+            elif has_kotlin:
+                meta["loader"] = "Kotlin JVM"
+            else:
+                meta["loader"] = "Unknown"
+
+            # Mod name from fabric.mod.json
+            if has_fabric:
+                try:
+                    import json as _json
+                    with zf.open("fabric.mod.json") as fj:
+                        fdata = _json.load(fj)
+                        meta["mod_name"] = fdata.get("name", fdata.get("id", "—"))[:40]
+                except Exception:
+                    pass
+            elif has_paper:
+                try:
+                    import json as _json
+                    with zf.open("plugin.yml") as pyml:
+                        content = pyml.read().decode(errors="replace")
+                        for line in content.splitlines():
+                            if line.strip().startswith("name:"):
+                                meta["mod_name"] = line.split(":", 1)[1].strip()[:40]
+                                break
+                except Exception:
+                    pass
+
+            # Main-Class from MANIFEST.MF
+            for n in names:
+                if n.upper().endswith("MANIFEST.MF"):
+                    try:
+                        with zf.open(n) as mf:
+                            for line in mf.read().decode(errors="replace").splitlines():
+                                if line.startswith("Main-Class:"):
+                                    meta["main_class"] = line.split(":", 1)[1].strip()[:60]
+                                    break
+                    except Exception:
+                        pass
+                    break
+    except Exception:
+        pass
+    return meta
+
+
+def get_sha256(file_path: Path) -> str:
+    """Dosyanın SHA-256 hash'ini hesapla."""
+    try:
+        with open(file_path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except Exception:
+        return ""
+
+
+def extract_jar_meta(jar_path) -> dict:
+    """parse_jar_meta için alias - geriye dönük uyumluluk."""
+    return parse_jar_meta(jar_path)
+
+
 def get_cp() -> str:
     sep = ";" if sys.platform.startswith("win") else ":"
     return f"{ENGINE_BIN}{sep}{ENGINE_LIB}/*"
@@ -218,8 +363,22 @@ if not ENGINE_OK:
     print("[!] Bot baslatildi ama Java motoru HAZIR DEGIL — /jar* komutlari ClassNotFound verecek.")
 
 async def run_engine(mode: str, inp, out=None, *extras):
-    cmd = ["java", "-cp", get_cp(), "sus.cracker.SusBytecodeEngine", mode, str(inp)]
-    if out:   cmd.append(str(out))
+    # Ubuntu VDS için optimize JVM flags:
+    # -Xms256m  → hızlı başlatma (minimum heap)
+    # -Xmx2G    → maksimum heap 2GB
+    # -Xss4M    → stack overflow riskini azaltır (derin bytecode analizi için)
+    # -XX:+UseG1GC → GC gecikmelerini azaltır (paralel çalışma için kritik)
+    # -XX:+UseStringDeduplication → obf/deobf işlemlerinde bellek tasarrufu
+    jvm_flags = [
+        "-Xms256m", "-Xmx2G", "-Xss4M",
+        "-XX:+UseG1GC", "-XX:+UseStringDeduplication",
+        "-XX:+TieredCompilation",
+        "-Djava.awt.headless=true",
+        "-Dfile.encoding=UTF-8",
+    ]
+    cmd = ["java"] + jvm_flags + ["-cp", get_cp(), "sus.cracker.SusBytecodeEngine", mode, str(inp)]
+    if out:
+        cmd.append(str(out))
     for ext in extras:
         if ext is not None:
             cmd.append(str(ext))
@@ -233,8 +392,13 @@ async def run_engine(mode: str, inp, out=None, *extras):
 
     async with TASK_SEMAPHORE:
         try:
+            # Linux/Ubuntu: nice -n 10 ile CPU önceliğini düşür (VDS stabilizasyonu)
+            if sys.platform.startswith("linux"):
+                final_cmd = ["nice", "-n", "10"] + cmd
+            else:
+                final_cmd = cmd
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
+                *final_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -473,16 +637,88 @@ class CloseTicketView(discord.ui.View):
             pass
 
 # ══════════════════════════════════════════════
-# EVENTS
+# BACKGROUND TASKS & ERROR HANDLERS
 # ══════════════════════════════════════════════
-@bot.event
-async def on_ready():
-    print(f"[+] {bot.user} ({bot.user.id}) online | discord.py {discord.__version__}")
+
+@tasks.loop(seconds=30)
+async def check_active_giveaways():
+    """Arka planda calisip suresi dolan cekilisleri otomatik sonuclandirir (bot restart olsa bile)."""
+    try:
+        g_data = load_json("giveaways")
+        if not g_data or not isinstance(g_data, dict):
+            return
+        now = discord.utils.utcnow().timestamp()
+        to_finish = []
+        for msg_id, info in list(g_data.items()):
+            if isinstance(info, dict) and info.get("ends_at", 0) <= now:
+                to_finish.append((msg_id, info))
+
+        for msg_id, info in to_finish:
+            ch_id = info.get("channel")
+            ch = bot.get_channel(ch_id)
+            if not ch:
+                try:
+                    ch = await bot.fetch_channel(ch_id)
+                except Exception:
+                    ch = None
+            if not ch or not isinstance(ch, discord.TextChannel):
+                g_data.pop(msg_id, None)
+                continue
+
+            try:
+                msg = await ch.fetch_message(int(msg_id))
+                reaction = discord.utils.get(msg.reactions, emoji="🎉")
+                users = [u async for u in reaction.users() if not u.bot] if reaction else []
+                odul = info.get("prize", "Bilinmiyor")
+                kazanan = info.get("winners", 1)
+                if not users:
+                    await ch.send(f"❌ **{odul}** çekilişine kimse katılmadı.")
+                else:
+                    winners = random.sample(users, min(kazanan, len(users)))
+                    wins_str = ", ".join(w.mention for w in winners)
+                    e = mk_embed("🎊 Çekiliş Sonuçlandı!",
+                                 f"**Ödül:** {odul}\n**Kazanan(lar):** {wins_str}\n\nTebrikler! 🎉", SUCCESS_COLOR)
+                    await ch.send(embed=e)
+            except (discord.NotFound, discord.HTTPException) as ex:
+                logger.warning(f"Giveaway sonlandırma hatası ({msg_id}): {ex}")
+            finally:
+                g_data.pop(msg_id, None)
+                save_json("giveaways", g_data)
+    except Exception as ex:
+        logger.error(f"check_active_giveaways task hatası: {ex}")
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Slash komutları için global hata yakalayıcı."""
+    try:
+        if isinstance(error, app_commands.MissingPermissions):
+            perms = ", ".join(f"`{p}`" for p in error.missing_permissions)
+            e = mk_embed("❌ Yetki Yetersiz", f"Bu komutu kullanmak için şu yetki(ler)e sahip olmalısın:\n{perms}", DANGER_COLOR)
+            return await safe_followup(interaction, embed=e, ephemeral=True)
+        elif isinstance(error, app_commands.BotMissingPermissions):
+            perms = ", ".join(f"`{p}`" for p in error.missing_permissions)
+            e = mk_embed("❌ Bot Yetkisi Eksik", f"Botun bu işlemi yapabilmesi için şu yetki(ler)e ihtiyacı var:\n{perms}", DANGER_COLOR)
+            return await safe_followup(interaction, embed=e, ephemeral=True)
+        elif isinstance(error, app_commands.CommandOnCooldown):
+            e = mk_embed("⏳ Bekleme Süresi", f"Lütfen `{error.retry_after:.1f}` saniye sonra tekrar dene.", WARNING_COLOR)
+            return await safe_followup(interaction, embed=e, ephemeral=True)
+
+        original = getattr(error, "original", error)
+        logger.error(f"Komut Hatası [{interaction.command.name if interaction.command else 'Unknown'}]: {original}", exc_info=original)
+        err_msg = str(original)[:400] if str(original) else "Bilinmeyen bir hata oluştu."
+        e = mk_embed("❌ İşlem Başarısız Oldu", f"Komut yürütülürken beklenmeyen bir hata meydana geldi:\n```\n{err_msg}\n```", DANGER_COLOR)
+        await safe_followup(interaction, embed=e, ephemeral=True)
+    except Exception as handle_ex:
+        logger.error(f"Hata yakalayıcı içi istisna: {handle_ex}")
+
+
+async def setup_hook():
+    """Bot başlangıç kancası (discord.py 2.0+ standardı)."""
     bot.add_view(VerifyButton())
     bot.add_view(TicketView())
     bot.add_view(CloseTicketView())
 
-    # SQLite veritabanını başlat
     if DB_AVAILABLE:
         try:
             await init_db()
@@ -490,16 +726,28 @@ async def on_ready():
         except Exception as exc:
             print(f"[-] DB init error: {exc}")
 
+    if not check_active_giveaways.is_running():
+        check_active_giveaways.start()
+        print("[+] Giveaway arka plan görevi başlatıldı.")
+
+    try:
+        synced = await bot.tree.sync()
+        print(f"[+] {len(synced)} slash commands synced globally")
+    except Exception as exc:
+        print(f"[-] Slash commands sync error: {exc}")
+
+bot.setup_hook = setup_hook
+
+# ══════════════════════════════════════════════
+# EVENTS
+# ══════════════════════════════════════════════
+@bot.event
+async def on_ready():
+    print(f"[+] {bot.user} ({bot.user.id}) online | discord.py {discord.__version__}")
     try:
         await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=STATUS_ACTIVITY))
     except Exception as exc:
         print(f"[-] Activity error: {exc}")
-
-    try:
-        synced = await bot.tree.sync()
-        print(f"[+] {len(synced)} slash commands synced")
-    except Exception as exc:
-        print(f"[-] Sync error: {exc}")
 
 # ──────────────────────────────────────────────
 # MEMBER JOIN / LEAVE
@@ -585,6 +833,7 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
 # ──────────────────────────────────────────────
 @bot.event
 async def on_message(message: discord.Message):
+    global XP_COOLDOWN
     if message.author.bot or not message.guild:
         return
     await bot.process_commands(message)
@@ -615,6 +864,9 @@ async def on_message(message: discord.Message):
 
         # ─── 3. XP System (DB) ────────────────────
         now = time.time()
+        if len(XP_COOLDOWN) > 500:
+            XP_COOLDOWN = {u: t for u, t in XP_COOLDOWN.items() if now - t < 120}
+
         if now - XP_COOLDOWN.get(uid, 0) >= 60:
             XP_COOLDOWN[uid] = now
             xp_amount = random.randint(15, 30)
@@ -623,15 +875,25 @@ async def on_message(message: discord.Message):
                 e = mk_embed("🎉 Seviye Atladın!",
                     f"Tebrikler {message.author.mention}! Artık **Seviye {new_level}** oldun! 🚀",
                     0xF39C12)
-                await message.channel.send(embed=e)
+                try:
+                    await message.channel.send(embed=e)
+                except Exception:
+                    pass
     else:
         # ─── Fallback: JSON tabanlı ────────────────
+        now = time.time()
+        if len(XP_COOLDOWN) > 500:
+            XP_COOLDOWN = {u: t for u, t in XP_COOLDOWN.items() if now - t < 120}
+
         afk_data = load_json("afk")
         if uid in afk_data:
             reason = afk_data.pop(uid).get("reason", "Belirtilmedi")
             save_json("afk", afk_data)
             e = mk_embed("👋 Tekrar Hoş Geldin!", f"{message.author.mention}, AFK modundan çıktın.\n**Eski Sebep:** {reason}", SUCCESS_COLOR)
-            await message.channel.send(embed=e, delete_after=6)
+            try:
+                await message.channel.send(embed=e, delete_after=6)
+            except Exception:
+                pass
         if message.mentions:
             afk_data = load_json("afk")
             for mentioned in message.mentions:
@@ -640,9 +902,11 @@ async def on_message(message: discord.Message):
                     info = afk_data[m_id]
                     since = f"<t:{int(info['time'])}:R>"
                     e = mk_embed("💤 Kullanıcı AFK", f"**{mentioned.display_name}** şu an AFK.\n**Sebep:** {info['reason']}\n**Süre:** {since}", WARNING_COLOR)
-                    await message.channel.send(embed=e, delete_after=8)
+                    try:
+                        await message.channel.send(embed=e, delete_after=8)
+                    except Exception:
+                        pass
                     break
-        now = time.time()
         if now - XP_COOLDOWN.get(uid, 0) >= 60:
             XP_COOLDOWN[uid] = now
             xp_data = load_json("xp")
@@ -654,7 +918,10 @@ async def on_message(message: discord.Message):
                 user_data["level"] += 1
                 lvl = user_data["level"]
                 e = mk_embed("🎉 Seviye Atladın!", f"Tebrikler {message.author.mention}! Artık **Seviye {lvl}** oldun! 🚀", 0xF39C12)
-                await message.channel.send(embed=e)
+                try:
+                    await message.channel.send(embed=e)
+                except Exception:
+                    pass
             save_json("xp", xp_data)
 
 # ══════════════════════════════════════════════
@@ -780,31 +1047,32 @@ def check_file_size(file: discord.Attachment) -> bool:
 
 def safe_unlink(path, retries: int = 3, delay: float = 0.2):
     """Windows WinError 32 (dosya kilitli) durumuna dayanıklı silme.
-    discord.File handle'ı veya antivirus/Java kilidi açık kalmış olabilir,
-    bu yüzden birkaç kez retry yapar, asla exception fırlatmaz.
-    NOT: event-loop'u bloklamamak için delay kısa tutuldu (max ~0.6sn)."""
+    İlk denemede silinemezse asyncio event loop'unu dondurmamak için
+    thread havuzunda retry yapar, asla hata fırlatmaz."""
     try:
         p = Path(path)
     except Exception:
         return
-    for attempt in range(retries):
-        try:
-            p.unlink(missing_ok=True)
-            return
-        except PermissionError:
-            if attempt < retries - 1:
+    try:
+        p.unlink(missing_ok=True)
+        return
+    except (PermissionError, OSError):
+        pass
+
+    def _retry_worker():
+        for attempt in range(retries):
+            try:
                 time.sleep(delay)
+                p.unlink(missing_ok=True)
+                return
+            except Exception:
                 continue
-            print(f"[!] safe_unlink: dosya kilitli, silinemedi: {p}")
-            return
-        except FileNotFoundError:
-            return
-        except OSError as ex:
-            if attempt < retries - 1:
-                time.sleep(delay)
-                continue
-            print(f"[!] safe_unlink OSError ({p}): {ex}")
-            return
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _retry_worker)
+    except RuntimeError:
+        _retry_worker()
 
 def close_discord_files(files):
     for f in files:
@@ -906,10 +1174,13 @@ async def poll_cmd(interaction: discord.Interaction, soru: str, secenekler: str 
     e = mk_embed(f"📊 OYLAMA: {soru}", "\n".join(desc_lines), INFO_COLOR)
     e.set_footer(text=f"Oylamayı başlatan: {interaction.user.display_name} | {FOOTER_TEXT}")
 
-    await interaction.response.send_message("✅ Oylama gönderildi.", ephemeral=True)
-    msg = await interaction.channel.send(embed=e)
-    for i in range(len(opts)):
-        await msg.add_reaction(emojis[i])
+    await interaction.response.send_message(embed=e)
+    try:
+        msg = await interaction.original_response()
+        for i in range(len(opts)):
+            await msg.add_reaction(emojis[i])
+    except Exception as ex:
+        logger.warning(f"Poll reaksiyon ekleme hatası: {ex}")
 
 # ─── 4. HEALTH / SYSTEM STATUS ────────────────
 @bot.tree.command(name="health", description="💻 Bot ve sistem sağlık durumunu göster.")
@@ -940,38 +1211,50 @@ async def health_cmd(interaction: discord.Interaction):
 @app_commands.default_permissions(manage_guild=True)
 async def settings_cmd(interaction: discord.Interaction):
     guild = interaction.guild
+    if guild is None:
+        return await interaction.response.send_message("❌ Bu komut sadece sunucu içinde kullanılabilir.", ephemeral=True)
 
-    mod_ch = guild.get_channel(MOD_LOG_CHANNEL) if MOD_LOG_CHANNEL else None
-    wel_ch = guild.get_channel(WELCOME_CHANNEL) if WELCOME_CHANNEL else None
-    tck_ca = guild.get_channel(TICKET_CATEGORY) if TICKET_CATEGORY else None
-    tck_lg = guild.get_channel(TICKET_LOG) if TICKET_LOG else None
-    v_role = guild.get_role(VERIFY_ROLE) if VERIFY_ROLE else None
-    a_role = guild.get_role(AUTO_ROLE) if AUTO_ROLE else None
-    s_ch   = guild.get_channel(STARBOARD_CH) if STARBOARD_CH else None
+    mod_ch_id = eff_mod_log(guild)
+    wel_ch_id = eff_welcome(guild)
+    tck_ca_id = eff_ticket_category(guild)
+    tck_lg_id = eff_ticket_log(guild)
+    v_role_id = eff_verify_role(guild)
+    a_role_id = eff_auto_role(guild)
+    s_ch_id   = eff_starboard(guild)
+    staff_id  = eff_staff_role(guild)
 
-    e = mk_embed("⚙️ SuS Cracker Bot — Yapılandırma Paneli", color=BRAND_COLOR)
+    mod_ch = guild.get_channel(mod_ch_id) if mod_ch_id else None
+    wel_ch = guild.get_channel(wel_ch_id) if wel_ch_id else None
+    tck_ca = guild.get_channel(tck_ca_id) if tck_ca_id else None
+    tck_lg = guild.get_channel(tck_lg_id) if tck_lg_id else None
+    v_role = guild.get_role(v_role_id) if v_role_id else None
+    a_role = guild.get_role(a_role_id) if a_role_id else None
+    s_ch   = guild.get_channel(s_ch_id) if s_ch_id else None
+    s_role = guild.get_role(staff_id) if staff_id else None
+
+    e = mk_embed("⚙️ SuS Cracker Bot — Sunucu Yapılandırma Paneli", color=BRAND_COLOR)
 
     # Motor ayarları
-    e.add_field(name="🛡️ Motor Ayarları",
-        value=f"• **Maks Dosya Boyutu:** `{MAX_FILE_SIZE_MB} MB`\n"
-              f"• **Zaman Aşımı:** `{ENGINE_TIMEOUT_SECONDS} sn`\n"
-              f"• **Eşzamanlı Görev:** `{MAX_CONCURRENT_TASKS}`\n"
-
+    e.add_field(name="🛡️ Motor & Bytecode Ayarları",
+        value=f"• **Maks Dosya:** `{MAX_FILE_SIZE_MB} MB`\n"
+              f"• **Motor Zaman Aşımı:** `{ENGINE_TIMEOUT_SECONDS} sn`\n"
+              f"• **Eşzamanlı İşlem Limiti:** `{MAX_CONCURRENT_TASKS}`\n"
               f"• **Varsayılan Deobf Motoru:** `{DEFAULT_DEOBF_ENGINE}`\n"
               f"• **Varsayılan Obf Seviyesi:** `{DEFAULT_OBF_PRESET}`", inline=False)
 
     # Kanal ve roller
-    e.add_field(name="📌 Kanal & Rol Bağlantıları",
+    e.add_field(name="📌 Sunucu Kanal & Rol Bağlantıları",
         value=f"• **Mod Log:** {mod_ch.mention if mod_ch else '`Kapalı (0)`'}\n"
               f"• **Hoş Geldin:** {wel_ch.mention if wel_ch else '`Kapalı (0)`'}\n"
               f"• **Ticket Kategori:** {tck_ca.name if tck_ca else '`Kapalı (0)`'}\n"
               f"• **Ticket Log:** {tck_lg.mention if tck_lg else '`Kapalı (0)`'}\n"
-              f"• **Starboard:** {s_ch.mention if s_ch else '`Kapalı (0)`'} (⭐ {STAR_THRESHOLD})\n"
+              f"• **Starboard:** {s_ch.mention if s_ch else '`Kapalı (0)`'} (⭐ `{STAR_THRESHOLD}`)\n"
               f"• **Doğrulama Rolü:** {v_role.mention if v_role else '`Kapalı (0)`'}\n"
-              f"• **Oto Rol:** {a_role.mention if a_role else '`Kapalı (0)`'}", inline=False)
+              f"• **Oto Rol:** {a_role.mention if a_role else '`Kapalı (0)`'}\n"
+              f"• **Staff Rolü:** {s_role.mention if s_role else '`Kapalı (0)`'}", inline=False)
 
-    e.add_field(name="💡 Ayarları Düzenleme",
-        value="Tüm ayarlar `discord_bot/.env` dosyasından okunur. Değişiklik yaptıktan sonra `/botreload` komutuyla güncelleyebilirsiniz.", inline=False)
+    e.add_field(name="💡 Bilgi",
+        value="Ayarları `/setup` çalıştırarak otomatik kurabilir veya `discord_bot/.env` üzerinden güncelleyip `/botreload` ile yenileyebilirsiniz.", inline=False)
 
     await interaction.response.send_message(embed=e, ephemeral=True)
 
@@ -979,13 +1262,14 @@ async def settings_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="botreload", description="🔄 Konfigürasyon ve verileri bota yeniden yükle.")
 @app_commands.default_permissions(manage_guild=True)
 async def botreload_cmd(interaction: discord.Interaction):
-    global MAX_FILE_SIZE_MB, ENGINE_TIMEOUT_SECONDS, MAX_CONCURRENT_TASKS
+    global MAX_FILE_SIZE_MB, ENGINE_TIMEOUT_SECONDS, MAX_CONCURRENT_TASKS, TASK_SEMAPHORE
     global DEFAULT_DEOBF_ENGINE, DEFAULT_OBF_PRESET, STATUS_ACTIVITY, BRAND_COLOR, LOG_LEVEL
 
     load_dotenv(override=True)
     MAX_FILE_SIZE_MB       = get_env_int("MAX_FILE_SIZE_MB", 50)
     ENGINE_TIMEOUT_SECONDS = get_env_int("ENGINE_TIMEOUT_SECONDS", 180)
     MAX_CONCURRENT_TASKS   = max(1, get_env_int("MAX_CONCURRENT_TASKS", 2))
+    TASK_SEMAPHORE         = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
     DEFAULT_DEOBF_ENGINE   = os.getenv("DEFAULT_DEOBF_ENGINE", "auto").strip().lower()
     DEFAULT_OBF_PRESET     = os.getenv("DEFAULT_OBF_PRESET", "aggressive").strip().lower()
     STATUS_ACTIVITY        = os.getenv("STATUS_ACTIVITY", "⚡ /help | SuS Suite v4.1").strip()
@@ -998,10 +1282,10 @@ async def botreload_cmd(interaction: discord.Interaction):
         pass
 
     e = mk_embed("🔄 Ayarlar Yeniden Yüklendi",
-        f"✅ `.env` konfigürasyonu başarıyla güncellendi!\n\n"
+        f"✅ `.env` konfigürasyonu ve görev kuyruğu başarıyla güncellendi!\n\n"
         f"• **Maks Dosya:** `{MAX_FILE_SIZE_MB}MB`\n"
         f"• **Motor Zaman Aşımı:** `{ENGINE_TIMEOUT_SECONDS}sn`\n"
-        f"• **Eşzamanlılık:** `{MAX_CONCURRENT_TASKS}`\n"
+        f"• **Eşzamanlılık Yuvası:** `{MAX_CONCURRENT_TASKS}`\n"
         f"• **Varsayılan Deobf:** `{DEFAULT_DEOBF_ENGINE}`\n"
         f"• **Varsayılan Obf:** `{DEFAULT_OBF_PRESET}`\n"
         f"• **Durum Metni:** `{STATUS_ACTIVITY}`", SUCCESS_COLOR)
@@ -1012,13 +1296,15 @@ async def botreload_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="jarobfuscator", description="🛡️ Minecraft mod/JAR dosyasını gelişmiş yöntemlerle obfuscate et.")
 @app_commands.describe(
     file="Obfuscate edilecek .jar dosyası",
-    preset="Obfuscation seviyesi: standard, aggressive veya extreme",
+    preset="Obfuscation seviyesi: lite, standard, aggressive, extreme veya ghost",
     rename_classes="Dahili sınıfları ve alanları görünmez Unicode ile gizle"
 )
 @app_commands.choices(preset=[
-    app_commands.Choice(name="Standard (Temel XOR & Sabit Karıştırma)", value="standard"),
-    app_commands.Choice(name="Aggressive (Polimorfik XOR + Opaque Predicates)", value="aggressive"),
-    app_commands.Choice(name="Extreme (Maksimum Şifreleme + Tam İsim Gizleme)", value="extreme")
+    app_commands.Choice(name="⚡ Lite   — Debug Strip + Pool Pollution (Hızlı & Hafif)",          value="lite"),
+    app_commands.Choice(name="🔐 Standard — Temel XOR + Sabit Karıştırma",                        value="standard"),
+    app_commands.Choice(name="🔒 Aggressive — Polimorfik XOR + Opaque Predicates",               value="aggressive"),
+    app_commands.Choice(name="🔥 Extreme — Maksimum Şifreleme + Tam Unicode İsim Gizleme",       value="extreme"),
+    app_commands.Choice(name="👻 Ghost   — Extreme + 3x Opaque + Max Pool Pollution (En Güçlü)", value="ghost"),
 ])
 async def jarobfuscator(
     interaction: discord.Interaction,
@@ -1038,19 +1324,29 @@ async def jarobfuscator(
         return await interaction.response.send_message(f"❌ Dosya çok büyük! Maksimum: `{MAX_FILE_SIZE_MB} MB`", ephemeral=True)
 
     await safe_defer(interaction, thinking=True)
-    tid = str(uuid.uuid4())[:8]
+    full_tid  = str(uuid.uuid4())
+    tid       = full_tid[:8]
     inp = TEMP_DIR  / f"{tid}_{safe_filename(file.filename)}"
     out = OUTPUT_DIR / f"{tid}_obfuscated_{safe_filename(file.filename)}"
     chosen_preset = preset.value if preset else DEFAULT_OBF_PRESET
 
-    # Canlı progress tracker
-    tracker = LiveProgressTracker(interaction, "🛡️ SuS Obfuscator — Şifreleniyor") if DB_AVAILABLE else None
+    tracker = LiveProgressTracker(interaction, f"🛡️ SuS Obfuscator [{chosen_preset.upper()}] — Şifreleniyor") if DB_AVAILABLE else None
     if tracker:
         await tracker.start()
 
     start_time = time.time()
     try:
         await file.save(inp)
+
+        # JAR metadata (input dosyasından)
+        jar_meta  = parse_jar_meta(inp)
+        file_sha  = ""
+        try:
+            with open(inp, "rb") as _f:
+                file_sha = hashlib.sha256(_f.read()).hexdigest()
+        except Exception:
+            pass
+
         ret, stdout, stderr = await run_engine("obfuscate", inp, out, chosen_preset, str(rename_classes).lower())
         elapsed = round(time.time() - start_time, 2)
 
@@ -1061,31 +1357,83 @@ async def jarobfuscator(
             log = redact_urls(stdout + stderr)[:1000]
             return await safe_followup(interaction, f"❌ Obfuscation hatası:\n```\n{log}\n```")
 
-        out_size_mb = out.stat().st_size / (1024 * 1024)
+        out_size_mb  = out.stat().st_size / (1024 * 1024)
+        orig_size_kb = file.size / 1024
+        out_size_kb  = out.stat().st_size / 1024
+
+        # Parse engine stats from stdout
+        stats_lines = {
+            "classes":  "",
+            "strings":  "",
+            "numbers":  "",
+            "flow":     "",
+            "pool":     "",
+            "vars":     "",
+        }
+        for line in stdout.splitlines():
+            if "Classes Processed" in line:
+                stats_lines["classes"] = line.split(":")[-1].strip()
+            elif "Strings Encrypted" in line:
+                stats_lines["strings"] = line.split(":")[-1].strip()
+            elif "Numbers Obfuscated" in line:
+                stats_lines["numbers"] = line.split(":")[-1].strip()
+            elif "Flow Invariants" in line:
+                stats_lines["flow"]    = line.split(":")[-1].strip()
+            elif "Pool Pollution" in line:
+                stats_lines["pool"]    = line.split(":")[-1].strip()
+            elif "LocalVars Cleared" in line:
+                stats_lines["vars"]    = line.split(":")[-1].strip()
+
+        preset_icons = {
+            "lite":       "⚡",
+            "standard":   "🔐",
+            "aggressive": "🔒",
+            "extreme":    "🔥",
+            "ghost":      "👻",
+        }
+        icon = preset_icons.get(chosen_preset, "🛡️")
+
+        out_fname = f"obfuscated_{safe_filename(file.filename)}"
+
+        e = mk_jar_embed(
+            title=f"✅ Obfuscation Tamamlandı — {icon} {chosen_preset.upper()}",
+            color=SUCCESS_COLOR,
+            filename=file.filename,
+            elapsed=elapsed,
+            desc_extra=f"**Preset:** `{chosen_preset.upper()}` | **Sınıf Yeniden Adlandırma:** `{'Aktif' if rename_classes else 'Devre Dışı'}`",
+            mod_name=jar_meta.get("mod_name", "—"),
+            size_str=f"{orig_size_kb:.1f} KB → {out_size_kb:.1f} KB",
+            loader=jar_meta.get("loader", "—"),
+            class_count=stats_lines["classes"] or jar_meta.get("class_count", "—"),
+            pkg_count=jar_meta.get("pkg_count", "—"),
+            main_class=jar_meta.get("main_class", "N/A"),
+            sha256=file_sha,
+            output_filename=out_fname,
+            uuid_str=full_tid,
+        )
+
+        # Engine istatistikleri
+        stat_parts = []
+        if stats_lines["strings"]:  stat_parts.append(f"🔤 String Şifreleme: `{stats_lines['strings']}`")
+        if stats_lines["numbers"]:  stat_parts.append(f"🔢 Sayı Karıştırma: `{stats_lines['numbers']}`")
+        if stats_lines["flow"]:     stat_parts.append(f"🔀 Flow Invariant: `{stats_lines['flow']}`")
+        if stats_lines["pool"]:     stat_parts.append(f"🗑️ Pool Kirliliği: `{stats_lines['pool']}`")
+        if stats_lines["vars"]:     stat_parts.append(f"🧹 Değişken Silme: `{stats_lines['vars']}`")
+        if stat_parts:
+            e.add_field(name="📈 Engine İstatistikleri", value="\n".join(stat_parts), inline=False)
+
         if out_size_mb > 24.5:
-            return await safe_followup(interaction, f"⚠️ İşlem tamamlandı ancak çıktı dosyası (`{out_size_mb:.1f} MB`) Discord'un 25MB yükleme sınırını aşıyor!")
-
-        e = mk_embed(f"🛡️ SuS Obfuscator v4.2 — Tamamlandı [{chosen_preset.upper()}]",
-            f"**`{file.filename}`** başarıyla kırılamaz seviyede şifrelendi! (⏱️ `{elapsed}s`)\n\n"
-            "🔒 **Uygulanan Üst Düzey Güvenlik Katmanları:**\n"
-            "• **Çok Katmanlı Dinamik String Şifreleme** (İndeks bazlı polinomik XOR)\n"
-            "• **Control Flow Flattening** (Doğrusal akış kırıcı durum makineleri)\n"
-            "• **Değişken & Parametre İsimlerinin Yok Edilmesi** (`var_` kalıntıları temizlendi)\n"
-            "• **Aritmetik & Bitwise Sabit Karıştırma** (Çok adımlı nötrleyici zincirler)\n"
-            "• **Matematiksel Invariant & Sahte Hata Tuzakları** (Anti-Decompiler)\n"
-            "• **Görünmez Unicode / Homoglyph Gizleme**\n"
-            "• **Debug, LineNumber & SourceFile Bilgilerinin Sıfırlanması**", SUCCESS_COLOR)
-
-        e.add_field(name="📊 Dosya Detayları",
-            value=f"• Orijinal: `{file.size / 1024:.1f} KB`\n"
-                  f"• Korunan: `{out.stat().st_size / 1024:.1f} KB`\n"
-                  f"• Seviye: `{chosen_preset.upper()}`", inline=True)
-
-        dfile = discord.File(out, filename=f"obfuscated_{safe_filename(file.filename)}")
-        try:
-            await safe_followup(interaction, embed=e, file=dfile)
-        finally:
-            close_discord_files([dfile])
+            e.add_field(name="⚠️ Boyut Uyarısı",
+                value=f"Çıktı dosyası (`{out_size_mb:.1f} MB`) Discord'un 25MB sınırını aşıyor!\n"
+                      "Dosyayı doğrudan sunucudan alabilirsin.",
+                inline=False)
+            await safe_followup(interaction, embed=e)
+        else:
+            dfile = discord.File(out, filename=out_fname)
+            try:
+                await safe_followup(interaction, embed=e, file=dfile)
+            finally:
+                close_discord_files([dfile])
     except Exception as exc:
         if tracker:
             await tracker.stop()
@@ -1096,15 +1444,20 @@ async def jarobfuscator(
 
 
 
-@bot.tree.command(name="jardeobfuscator", description="⚡ JAR'ı deobfuscate et + temiz JAR ve kaynak kodu al.")
+
+
+
+@bot.tree.command(name="jardeobfuscator", description="⚡ JAR modunun şifresini çöz + temiz JAR ve kaynak kodu al.")
 @app_commands.describe(
-    file="Deobfuscate edilecek .jar dosyası",
-    engine="Decompiler motor tercihi (Auto / CFR / Vineflower)"
+    file="Deobfuscate edilecek .jar veya .zip dosyası",
+    engine="Decompiler motoru: auto, vineflower, cfr, fernflower veya jadx"
 )
 @app_commands.choices(engine=[
-    app_commands.Choice(name="Auto (Önce CFR, hata durumunda Vineflower)", value="auto"),
-    app_commands.Choice(name="Vineflower (Gelişmiş Decompiler & Member Renamer)", value="vineflower"),
-    app_commands.Choice(name="CFR (Agresif Anti-Obf & Decompile Motoru)", value="cfr")
+    app_commands.Choice(name="🤖 Auto (Önce CFR, hata durumunda Vineflower)", value="auto"),
+    app_commands.Choice(name="🌸 Vineflower (Gelişmiş Decompiler & Member Renamer)", value="vineflower"),
+    app_commands.Choice(name="⚡ CFR (Agresif Anti-Obfuscation Motoru)", value="cfr"),
+    app_commands.Choice(name="🌿 Fernflower (IntelliJ IDEA Resmi Decompiler Motoru)", value="fernflower"),
+    app_commands.Choice(name="📱 Jadx (Modern Dex/Java Decompiler & AST Restorer)", value="jadx")
 ])
 async def jardeobfuscator(
     interaction: discord.Interaction,
@@ -1112,7 +1465,7 @@ async def jardeobfuscator(
     engine: app_commands.Choice[str] = None
 ):
     if not file.filename.lower().endswith((".jar", ".zip")):
-        return await interaction.response.send_message("❌ Geçerli bir `.jar` dosyası yükle!", ephemeral=True)
+        return await interaction.response.send_message("❌ Geçerli bir `.jar` veya `.zip` dosyası yükle!", ephemeral=True)
 
     if DB_AVAILABLE:
         ok, msg = await verify_user_quota(interaction, file)
@@ -1122,19 +1475,23 @@ async def jardeobfuscator(
         return await interaction.response.send_message(f"❌ Dosya çok büyük! Maksimum limit: `{MAX_FILE_SIZE_MB} MB`", ephemeral=True)
 
     await safe_defer(interaction, thinking=True)
-    tid   = str(uuid.uuid4())[:8]
+    full_tid = str(uuid.uuid4())
+    tid = full_tid[:8]
     inp   = TEMP_DIR  / f"{tid}_{safe_filename(file.filename)}"
     clean = OUTPUT_DIR / f"{tid}_deobfuscated_{safe_filename(file.filename)}"
     src   = OUTPUT_DIR / f"{tid}_secure_source.zip"
     chosen_engine = engine.value if engine else DEFAULT_DEOBF_ENGINE
 
-    tracker = LiveProgressTracker(interaction, "⚡ SuS Deobfuscator — Çözülüyor") if DB_AVAILABLE else None
+    tracker = LiveProgressTracker(interaction, f"⚡ SuS Deobfuscator [{chosen_engine.upper()}] — Çözülüyor") if DB_AVAILABLE else None
     if tracker:
         await tracker.start()
 
     start_time = time.time()
     try:
         await file.save(inp)
+        file_sha = get_sha256(inp)
+        jar_meta = extract_jar_meta(inp)
+
         ret, stdout, stderr = await run_engine("deobfuscate", inp, clean, src, chosen_engine)
         elapsed = round(time.time() - start_time, 2)
 
@@ -1145,25 +1502,60 @@ async def jardeobfuscator(
             log = redact_urls(stdout + stderr)[:1000]
             return await safe_followup(interaction, f"❌ DeObfuscation hatası:\n```\n{log}\n```")
 
-        e = mk_embed("⚡ SuS Deobfuscator v4.1 — Tamamlandı",
-            f"`{file.filename}` başarıyla çözüldü, optimize edildi ve kaynak kodları çıkarıldı! (⏱️ `{elapsed}s`)\n\n"
-            "📦 **Teslim Edilen Paketler:**\n"
-            f"• `deobfuscated_{file.filename}` – Temiz bytecode JAR\n"
-            "• `source_code.zip` – Eksiksiz `.java` kaynak kodları + `DEOBFUSCATION_REPORT.md`", 0x1ABC9C)
+        clean_kb = clean.stat().st_size / 1024 if clean.exists() else 0
+        src_kb   = src.stat().st_size / 1024 if src.exists() else 0
+        orig_kb  = file.size / 1024
 
-        files_out = []
-        if clean.exists() and clean.stat().st_size <= 24.5 * 1024 * 1024:
-            files_out.append(discord.File(clean, filename=f"deobfuscated_{safe_filename(file.filename)}"))
-        if src.exists() and src.stat().st_size <= 24.5 * 1024 * 1024:
-            files_out.append(discord.File(src, filename=f"source_code_{safe_filename(file.filename).replace('.jar','')}.zip"))
+        e = mk_jar_embed(
+            title=f"⚡ Deobfuscation Tamamlandı — {chosen_engine.upper()}",
+            color=0x1ABC9C,
+            filename=file.filename,
+            elapsed=elapsed,
+            desc_extra=f"**Decompiler Motoru:** `{chosen_engine.upper()}` | **Çıktı Modu:** `Bytecode Clean + Source ZIP`",
+            mod_name=jar_meta.get("mod_name", "—"),
+            size_str=f"{orig_kb:.1f} KB → {clean_kb:.1f} KB (Src: {src_kb:.1f} KB)",
+            loader=jar_meta.get("loader", "—"),
+            class_count=jar_meta.get("class_count", "—"),
+            pkg_count=jar_meta.get("pkg_count", "—"),
+            main_class=jar_meta.get("main_class", "N/A"),
+            sha256=file_sha,
+            output_filename=f"deobfuscated_{safe_filename(file.filename)}",
+            uuid_str=full_tid,
+        )
 
-        if not files_out:
-            return await safe_followup(interaction, "⚠️ Çıktı dosyaları Discord'un 25MB yükleme sınırını aşıyor!")
+        e.add_field(
+            name="📦 Oluşturulan Paketler",
+            value=f"• 💎 `deobfuscated_{safe_filename(file.filename)}` — Temiz bytecode JAR (`{clean_kb:.1f} KB`)\n"
+                  f"• 📜 `source_{safe_filename(file.filename).replace('.jar', '')}.zip` — Kaynak kodları (`{src_kb:.1f} KB`)",
+            inline=False
+        )
 
-        try:
-            await safe_followup(interaction, embed=e, files=files_out)
-        finally:
-            close_discord_files(files_out)
+        total_size = sum(p.stat().st_size for p in [clean, src] if p.exists())
+        if total_size <= 24.5 * 1024 * 1024:
+            files_out = []
+            if clean.exists():
+                files_out.append(discord.File(clean, filename=f"deobfuscated_{safe_filename(file.filename)}"))
+            if src.exists():
+                files_out.append(discord.File(src, filename=f"source_{safe_filename(file.filename).replace('.jar','')}.zip"))
+            if not files_out:
+                return await safe_followup(interaction, "⚠️ Çıktı dosyaları oluşturulamadı veya boş!")
+            try:
+                await safe_followup(interaction, embed=e, files=files_out)
+            finally:
+                close_discord_files(files_out)
+        else:
+            await safe_followup(interaction, embed=e)
+            for p, prefix, ext in [(clean, "deobfuscated_", ""), (src, "source_", ".zip")]:
+                if p.exists():
+                    if p.stat().st_size <= 24.5 * 1024 * 1024:
+                        fn = f"{prefix}{safe_filename(file.filename)}" if not ext else f"{prefix}{safe_filename(file.filename).replace('.jar','')}.zip"
+                        df = discord.File(p, filename=fn)
+                        try:
+                            await safe_followup(interaction, file=df)
+                        finally:
+                            close_discord_files([df])
+                    else:
+                        await safe_followup(interaction, f"⚠️ `{p.name}` (`{p.stat().st_size / (1024*1024):.1f} MB`) Discord 25MB sınırını aşıyor!")
     except Exception as exc:
         if tracker:
             await tracker.stop()
@@ -1277,6 +1669,8 @@ async def jardeobfuscationsrc(
                 close_discord_files([dfile])
             return
 
+        file_sha = get_sha256(inp)
+        jar_meta = extract_jar_meta(inp)
         ret, stdout, stderr = await run_engine("deobfuscate", inp, clean, src, chosen_engine)
         elapsed = round(time.time() - start_time, 2)
 
@@ -1287,24 +1681,46 @@ async def jardeobfuscationsrc(
             log = redact_urls(stdout + stderr)[:1000]
             return await safe_followup(interaction, f"❌ DeObfuscation / Kaynak Kod Çıkarma Hatası:\n```\n{log}\n```")
 
+        src_kb = src.stat().st_size / 1024
+        orig_kb = file.size / 1024
+        out_fname = f"source_code_{safe_filename(file.filename).replace('.jar', '')}.zip"
+
+        e = mk_jar_embed(
+            title=f"⚡ Deobfuscation Source — {chosen_engine.upper()}",
+            color=0x1ABC9C,
+            filename=file.filename,
+            elapsed=elapsed,
+            desc_extra=f"**Decompiler Motoru:** `{chosen_engine.upper()}` | **Çıktı:** `.java` Kaynak Kodları Arşivi",
+            mod_name=jar_meta.get("mod_name", "—"),
+            size_str=f"{orig_kb:.1f} KB → {src_kb:.1f} KB (ZIP)",
+            loader=jar_meta.get("loader", "—"),
+            class_count=jar_meta.get("class_count", "—"),
+            pkg_count=jar_meta.get("pkg_count", "—"),
+            main_class=jar_meta.get("main_class", "N/A"),
+            sha256=file_sha,
+            output_filename=out_fname,
+            uuid_str=full_tid if 'full_tid' in locals() else tid,
+        )
+
+        e.add_field(
+            name="📦 Arşiv İçeriği",
+            value="• Tüm decompile edilmiş ve temizlenmiş `.java` sınıfları\n"
+                  "• `fabric.mod.json`, `mods.toml`, `assets/` ve `data/` varlıkları\n"
+                  "• `DEOBFUSCATION_REPORT.md` ayrıntılı analiz raporu",
+            inline=False
+        )
+
         if src.stat().st_size > 24.5 * 1024 * 1024:
-            return await safe_followup(interaction, f"⚠️ Kaynak kodu ZIP arşivi (`{src.stat().st_size / (1024*1024):.1f} MB`) Discord'un 25MB sınırını aşıyor!")
-
-        e = mk_embed("⚡ SuS Deobfuscator — Java Kaynak Kodu Arşivi",
-            f"**`{file.filename}`** modunun şifrelemesi çözüldü ve asıl **.java** kaynak kodları çıkarıldı! (⏱️ `{elapsed}s`)\n\n"
-            "📦 **Arşiv İçeriği:**\n"
-            "• Tüm temizlenmiş `.java` sınıfları\n"
-            "• `fabric.mod.json`, `mods.toml`, `assets/` ve `data/` varlıkları\n"
-            "• `DEOBFUSCATION_REPORT.md` ayrıntılı analiz raporu", 0x1ABC9C)
-
-        e.add_field(name="⚙️ Decompiler Tercihi", value=f"`{chosen_engine.upper()}`", inline=True)
-        e.add_field(name="📦 Arşiv Boyutu", value=f"`{src.stat().st_size / 1024:.1f} KB`", inline=True)
-
-        dfile = discord.File(src, filename=f"source_code_{safe_filename(file.filename).replace('.jar', '')}.zip")
-        try:
-            await safe_followup(interaction, embed=e, file=dfile)
-        finally:
-            close_discord_files([dfile])
+            e.add_field(name="⚠️ Uyarı",
+                        value=f"Kaynak kodu ZIP arşivi (`{src.stat().st_size / (1024*1024):.1f} MB`) Discord 25MB sınırını aşıyor!",
+                        inline=False)
+            await safe_followup(interaction, embed=e)
+        else:
+            dfile = discord.File(src, filename=out_fname)
+            try:
+                await safe_followup(interaction, embed=e, file=dfile)
+            finally:
+                close_discord_files([dfile])
     except Exception as exc:
         logger.error(f"jardeobfuscationsrc hatası: {exc}", exc_info=True)
         if tracker:
@@ -1339,7 +1755,7 @@ async def deobfuscationsrc(
     await jardeobfuscationsrc.callback(interaction, file, engine)
 
 
-@bot.tree.command(name="jarcracker", description="🔓 [SuS Cracker v4.1] JAR'ı 43 metotla crack et — Meteor/Fabric/Client/Forge destekli.")
+@bot.tree.command(name="jarcracker", description="🔓 [SuS Cracker v5.0] JAR'ı 60 metotla crack et — Meteor/Fabric/Client/Forge/Kotlin/Paper.")
 @app_commands.describe(
     file="Crack edilecek .jar dosyası",
     target="Hedef platform türü (varsayılan: any)"
@@ -1349,7 +1765,9 @@ async def deobfuscationsrc(
     app_commands.Choice(name="☄️ Meteor Client Addon",                         value="meteor"),
     app_commands.Choice(name="🧵 Fabric Mod (1.20.x / 1.21.x)",               value="fabric"),
     app_commands.Choice(name="🔧 Forge Mod (1.12 / 1.16 / 1.20+)",            value="forge"),
-    app_commands.Choice(name="🌙 Lunar Client / Badlion / LabyMod / Impact",   value="client"),
+    app_commands.Choice(name="🌙 Lunar / Badlion / LabyMod / Impact Client",   value="client"),
+    app_commands.Choice(name="🔮 Kotlin JVM Mod (Metadata & Intrinsics)",     value="kotlin"),
+    app_commands.Choice(name="📜 Paper / Spigot Server Plugin",               value="paper"),
 ])
 async def jarcracker(
     interaction: discord.Interaction,
@@ -1373,21 +1791,27 @@ async def jarcracker(
         "fabric": "🧵 Fabric Mod",
         "forge":  "🔧 Forge Mod",
         "client": "🌙 Lunar / Badlion / LabyMod / Impact",
+        "kotlin": "🔮 Kotlin JVM Mod",
+        "paper":  "📜 Paper / Spigot Plugin",
     }
     target_label = target_labels.get(chosen_target, chosen_target.upper())
 
     await safe_defer(interaction, thinking=True)
-    tid = str(uuid.uuid4())[:8]
+    full_tid = str(uuid.uuid4())
+    tid = full_tid[:8]
     inp = TEMP_DIR  / f"{tid}_{safe_filename(file.filename)}"
     out = OUTPUT_DIR / f"{tid}_cracked_{safe_filename(file.filename)}"
 
-    tracker = LiveProgressTracker(interaction, f"🔓 SuS Cracker — {target_label} İşleniyor") if DB_AVAILABLE else None
+    tracker = LiveProgressTracker(interaction, f"🔓 SuS Cracker v5.0 — {target_label} İşleniyor") if DB_AVAILABLE else None
     if tracker:
         await tracker.start()
 
     start_time = time.time()
     try:
         await file.save(inp)
+        file_sha = get_sha256(inp)
+        jar_meta = extract_jar_meta(inp)
+
         ret, stdout, stderr = await run_engine("crack", inp, out, chosen_target)
         elapsed = round(time.time() - start_time, 2)
 
@@ -1414,20 +1838,20 @@ async def jarcracker(
         }
         for l in lines:
             ll = l.lower()
-            if any(k in ll for k in ["hwid", "keyauth", "license", "auth", "reflect", "static field", "heuristic", "threadlocal", "annotation", "class.forname"]):
+            if any(k in ll for k in ["hwid", "keyauth", "license", "auth", "reflect", "static field", "heuristic", "threadlocal", "annotation", "class.forname", "kotlin", "lambda"]):
                 cats["🔐 Auth & License"].append(l.strip())
-            elif any(k in ll for k in ["webhook", "http", "endpoint", "cloud", "ws", "ip", "grabber", "keyauth api"]):
+            elif any(k in ll for k in ["webhook", "http", "endpoint", "cloud", "ws", "ip", "grabber", "keyauth api", "ssl", "pinning", "socket"]):
                 cats["🌐 Network & API"].append(l.strip())
-            elif any(k in ll for k in ["anti-vm", "anti-debug", "stacktrace", "agent", "cert", "freeze", "runtimeexec"]):
+            elif any(k in ll for k in ["anti-vm", "anti-debug", "stacktrace", "agent", "cert", "freeze", "runtimeexec", "ptrace", "timing", "classloader"]):
                 cats["🛡️ Anti-Analysis"].append(l.strip())
             elif any(k in ll for k in ["vip", "cosmetic", "premium", "baritone", "scape", "badge", "ranked", "subscriber"]):
                 cats["🎭 Cosmetic & VIP"].append(l.strip())
-            elif any(k in ll for k in ["module", "meteor", "exit", "config", "json", "timer", "scheduler", "fabric", "forge", "native", "hash"]):
+            elif any(k in ll for k in ["module", "meteor", "exit", "config", "json", "timer", "scheduler", "fabric", "forge", "native", "hash", "paper", "spigot"]):
                 cats["⚙️ System & Module"].append(l.strip())
             else:
                 cats["🧬 Bytecode & Struct"].append(l.strip())
 
-        max_methods = 43
+        max_methods = 60
         pct = min(patched_num / max(max_methods, 1), 1.0)
         filled = int(pct * 22)
         bar = "▓" * filled + "░" * (22 - filled)
@@ -1435,16 +1859,23 @@ async def jarcracker(
 
         out_size_kb = out.stat().st_size / 1024
         orig_size_kb = file.size / 1024
-        over_limit = out.stat().st_size > 24.5 * 1024 * 1024
+        out_fname = f"cracked_{safe_filename(file.filename)}"
 
-        e = mk_embed(
-            "🔓 SuS Cracker v4.1 — Crack Tamamlandı!",
-            f"**`{file.filename}`** başarıyla crack edildi! ⏱️ `{elapsed}s`\n"
-            f"**Hedef Platform:** {target_label}\n"
-            f"**Toplam Patch:** `{patched_num}` uygulama\n"
-            f"**Tarama:** `{scanned_num if scanned_num else 'N/A'}` class\n\n"
-            f"**İlerleme:**\n`{bar}` `{bar_pct}%` — `{patched_num}`/`{max_methods}` metot aktif",
-            0xF1C40F
+        e = mk_jar_embed(
+            title=f"🔓 SuS Cracker v5.0 — {target_label}",
+            color=0xF1C40F,
+            filename=file.filename,
+            elapsed=elapsed,
+            desc_extra=f"**Hedef:** `{target_label}` | **İlerleme:** `{bar}` `{bar_pct}%` (`{patched_num}/{max_methods}`)",
+            mod_name=jar_meta.get("mod_name", "—"),
+            size_str=f"{orig_size_kb:.1f} KB → {out_size_kb:.1f} KB",
+            loader=jar_meta.get("loader", "—"),
+            class_count=f"{scanned_num} sınıf" if scanned_num else jar_meta.get("class_count", "—"),
+            pkg_count=jar_meta.get("pkg_count", "—"),
+            main_class=jar_meta.get("main_class", "N/A"),
+            sha256=file_sha,
+            output_filename=out_fname,
+            uuid_str=full_tid,
         )
 
         methods_table = (
@@ -1463,10 +1894,15 @@ async def jarcracker(
             "M34 StackTrace Defz │ M35 Heuristic Auth │ M36 Meteor Ext\n"
             "M37 Client Premium  │ M38 Forge VerLock  │ M39 ProcBld Deep\n"
             "M40 forName Bypass  │ M41 ThreadLocal    │ M42 URL Redir\n"
-            "M43 Annotation Strip"
+            "M43 Annotation Strip│ M44 Kotlin Intrins │ M45 Kotlin MetaClr\n"
+            "M46 SSL TrustAll    │ M47 Custom DRM Kill│ M48 ByteBuddy Defz\n"
+            "M49 Lambda Auth Def │ M50 Paper License  │ M51 Heartbeat Stub\n"
+            "M52 JNI Library NOP │ M53 Timing Attack  │ M54 SecManager Def\n"
+            "M55 Dynamic Inv Def │ M56 ClassLoader Byp│ M57 Env Variable\n"
+            "M58 Prefs/Registry  │ M59 DNS Resolver   │ M60 Obf Reflection"
             "```"
         )
-        e.add_field(name="🗂️ Crack Metot Tablosu (43/43)", value=methods_table, inline=False)
+        e.add_field(name="🗂️ Crack Metot Tablosu (60/60 v5.0)", value=methods_table, inline=False)
 
         cat_lines = []
         for cat_name, cat_items in cats.items():
@@ -1474,12 +1910,6 @@ async def jarcracker(
                 cat_lines.append(f"**{cat_name}** — `{len(cat_items)}` patch")
         if cat_lines:
             e.add_field(name="📊 Kategori Dağılımı", value="\n".join(cat_lines), inline=True)
-
-        e.add_field(name="📁 Dosya Bilgisi",
-            value=f"• Orijinal: `{orig_size_kb:.1f} KB`\n"
-                  f"• Crack'li: `{out_size_kb:.1f} KB`\n"
-                  f"• Platform: `{chosen_target.upper()}`",
-            inline=True)
 
         visible_patches = [redact_urls(l.strip().lstrip("* ")) for l in lines if l.strip()][-12:]
         if visible_patches:
@@ -1492,13 +1922,13 @@ async def jarcracker(
             if raw_log:
                 e.add_field(name="📋 Engine Çıktısı", value=f"```\n{raw_log}\n```", inline=False)
 
-        if over_limit:
+        if out.stat().st_size > 24.5 * 1024 * 1024:
             e.add_field(name="⚠️ Uyarı",
                 value=f"Crack'li dosya (`{out.stat().st_size / (1024*1024):.1f} MB`) Discord'un 25MB limitini aşıyor!",
                 inline=False)
             await safe_followup(interaction, embed=e)
         else:
-            dfile = discord.File(out, filename=f"cracked_{safe_filename(file.filename)}")
+            dfile = discord.File(out, filename=out_fname)
             try:
                 await safe_followup(interaction, embed=e, file=dfile)
             finally:
@@ -1647,10 +2077,23 @@ async def jarscanner(interaction: discord.Interaction, file: discord.Attachment)
                                   for l in (stdout2 or "").splitlines() if "[CLEANED_INJECTION]" in l]
 
             cache_badge = " • ⚡ *[Önbellek]*" if is_cache_hit else ""
-            e = mk_embed("🚨 SILENTNET DETECT — Zararlı Tespit & Temizlendi",
-                         f"**`{sname[:100]}`** içinde **SilentNet stealer/RAT** payload'u tespit edildi ve etkisiz hale getirildi!{cache_badge}\n\n"
-                         f"🎯 **Tehdit Skoru:** `{threat_score}/100` — `{redact_urls(verdict_str[:80])}`",
-                         DANGER_COLOR)
+            jar_meta = extract_jar_meta(inp)
+            e = mk_jar_embed(
+                title="🚨 SILENTNET DETECT — Zararlı Tespit & Temizlendi",
+                color=DANGER_COLOR,
+                filename=sname,
+                elapsed=0,
+                desc_extra=f"**`{sname[:100]}`** içinde **SilentNet stealer/RAT** payload'u tespit edildi ve etkisiz hale getirildi!{cache_badge}\n\n🎯 **Tehdit Skoru:** `{threat_score}/100` — `{redact_urls(verdict_str[:80])}`",
+                mod_name=jar_meta.get("mod_name", "—"),
+                size_str=f"`{len(all_payloads)}` payload | `{len(all_loaders)}` loader | `{len(injection_hits)}` hook",
+                loader=jar_meta.get("loader", "—"),
+                class_count=classes_count,
+                pkg_count=jar_meta.get("pkg_count", "—"),
+                main_class=jar_meta.get("main_class", "N/A"),
+                sha256=file_sha256,
+                output_filename=f"cleaned_{sname}" if ret2 == 0 and out.exists() else "",
+                uuid_str=tid,
+            )
 
             e.add_field(name="📁 Payload Dosyası",
                         value=f"`{len(all_payloads)}` adet `.set`/payload", inline=True)
@@ -1708,7 +2151,25 @@ async def jarscanner(interaction: discord.Interaction, file: discord.Attachment)
         color = DANGER_COLOR if has_threats else (0xFFA500 if threat_score >= 20 else INFO_COLOR)
         title = "🔍 SuS Scanner — Şüpheli Tehditler" if has_threats else "✅ SuS Scanner — Temiz Görünüyor"
         cache_badge = " • ⚡ *[Önbellek]*" if is_cache_hit else ""
-        e = mk_embed(title, f"`{sname[:100]}`\n🎯 **Tehdit Skoru:** `{threat_score}/100`{cache_badge}", color)
+        
+        jar_meta = extract_jar_meta(inp)
+        e = mk_jar_embed(
+            title=title,
+            color=color,
+            filename=sname,
+            elapsed=0,
+            desc_extra=f"🎯 **Tehdit Skoru:** `{threat_score}/100` — `{redact_urls(verdict_str[:80])}`{cache_badge}",
+            mod_name=jar_meta.get("mod_name", "—"),
+            size_str=f"`{len(all_payloads)}` payload | `{len(all_loaders)}` loader | `{len(injection_hits)}` hook",
+            loader=jar_meta.get("loader", "—"),
+            class_count=classes_count,
+            pkg_count=jar_meta.get("pkg_count", "—"),
+            main_class=jar_meta.get("main_class", "N/A"),
+            sha256=file_sha256,
+            output_filename="",
+            uuid_str=tid,
+        )
+        
         chunks = [output[i:i+900] for i in range(0, min(len(output), 3600), 900)]
         for idx, chunk in enumerate(chunks[:4]):
             e.add_field(name=f"📋 Sonuç{' (devam)' if idx else ''}", value=f"```\n{chunk}\n```", inline=False)
@@ -1753,7 +2214,8 @@ async def jarclear(
         return await interaction.response.send_message(f"❌ Dosya çok büyük! Maksimum limit: `{MAX_FILE_SIZE_MB} MB`", ephemeral=True)
 
     await safe_defer(interaction, thinking=True)
-    tid = str(uuid.uuid4())[:8]
+    full_tid = str(uuid.uuid4())
+    tid = full_tid[:8]
     inp = TEMP_DIR / f"{tid}_{safe_filename(file.filename)}"
     out = OUTPUT_DIR / f"{tid}_cleaned_{safe_filename(file.filename)}"
 
@@ -1761,14 +2223,19 @@ async def jarclear(
     if tracker:
         await tracker.start()
 
+    start_time = time.time()
     try:
         await file.save(inp)
+        file_sha = get_sha256(inp)
+        jar_meta = extract_jar_meta(inp)
+
         if honeypot_url and honeypot_url.strip():
             cand = honeypot_url.strip()
             target_hp = cand if is_safe_http_url(cand) else "http://127.0.0.1:9999/cleaned_webhook"
         else:
             target_hp = "http://127.0.0.1:9999/cleaned_webhook"
         ret, stdout, stderr = await run_engine("clean", inp, out, target_hp)
+        elapsed = round(time.time() - start_time, 2)
 
         if tracker:
             await tracker.stop()
@@ -1785,7 +2252,6 @@ async def jarclear(
                 if wh and wh not in exposed_webhooks:
                     exposed_webhooks.append(wh)
 
-        # Motor sayaçları (dürüst rapor için)
         purged, b64purged, susp_count, silent_count = 0, 0, 0, 0
         inj_count, fabric_patched = 0, False
         raw_out = stdout or ""
@@ -1802,7 +2268,6 @@ async def jarclear(
         if m_sil:
             silent_count = int(m_sil.group(1))
             fabric_patched = m_sil.group(2) == "true"
-        # Cerrahi enjeksiyon temizleme detayları
         cleaned_injections = [l.replace("[CLEANED_INJECTION]", "").strip()
                               for l in raw_out.splitlines() if "[CLEANED_INJECTION]" in l]
         inj_count = len(cleaned_injections)
@@ -1811,13 +2276,27 @@ async def jarclear(
         susp_methods = [l.replace("[SUSPICIOUS_METHOD]", "").strip()
                         for l in raw_out.splitlines() if "[SUSPICIOUS_METHOD]" in l]
 
-        disp_name = safe_filename(file.filename)[:100]
+        orig_kb = file.size / 1024
+        out_kb  = out.stat().st_size / 1024
+        out_fname = f"cleaned_{safe_filename(file.filename)}"
 
-        # Hiçbir şey bulunamadıysa sahte başarı yazma
         if purged == 0 and silent_count == 0 and susp_count == 0 and inj_count == 0:
-            e = mk_embed("✅ SuS Cleaner — Temiz Görünüyor",
-                f"**`{disp_name}`** tarandı, bilinen zararlı gösterge bulunamadı — işlem yapılmadı, jar aynen iletiliyor.",
-                SUCCESS_COLOR)
+            e = mk_jar_embed(
+                title="✅ JAR Temizleme — Bilinen Tehdit Yok",
+                color=SUCCESS_COLOR,
+                filename=file.filename,
+                elapsed=elapsed,
+                desc_extra="Dosyada bilinen zararlı imza bulunamadı. JAR içeriği kontrol edildi.",
+                mod_name=jar_meta.get("mod_name", "—"),
+                size_str=f"{orig_kb:.1f} KB (Değişmedi)",
+                loader=jar_meta.get("loader", "—"),
+                class_count=jar_meta.get("class_count", "—"),
+                pkg_count=jar_meta.get("pkg_count", "—"),
+                main_class=jar_meta.get("main_class", "N/A"),
+                sha256=file_sha,
+                output_filename=f"checked_{safe_filename(file.filename)}",
+                uuid_str=full_tid,
+            )
             dfile = discord.File(inp, filename=f"checked_{safe_filename(file.filename)}")
             try:
                 await safe_followup(interaction, embed=e, file=dfile)
@@ -1825,28 +2304,34 @@ async def jarclear(
                 close_discord_files([dfile])
             return
 
-        desc_lines = [
-            f"**`{disp_name}`** dosyasındaki tehditler etkisiz hale getirildi!\n",
-            f"🎯 **Honeypot Hedefi:** `{redact_urls(target_hp)}`",
-            f"🧹 **Etkisiz Hale Getirilen:** `{purged}` tehdit" + (f" (`{b64purged}` Base64-gizli)" if b64purged else ""),
-        ]
+        desc_extra = f"**Etkisiz Tehdit:** `{purged}`" + (f" (`{b64purged}` Base64)" if b64purged else "")
         if silent_count:
-            desc_lines.append(f"🗑️ **SilentNet Payload Silindi:** `{silent_count}` dosya")
+            desc_extra += f" | **SilentNet Silindi:** `{silent_count}`"
         if inj_count:
-            desc_lines.append(f"💉 **Enjekte Hook Temizlendi:** `{inj_count}` adet")
+            desc_extra += f" | **Hook Temizlendi:** `{inj_count}`"
         if fabric_patched:
-            desc_lines.append("🧵 **fabric.mod.json:** Zararlı referanslar temizlendi ✅")
-        if susp_count:
-            desc_lines.append(f"⚠️ **Şüpheli Metot:** `{susp_count}` (elle incele)")
-        e = mk_embed("🧹 SuS Cleaner & Honeypot — Zararlı Kodlar Temizlendi",
-            "\n".join(desc_lines), SUCCESS_COLOR)
+            desc_extra += " | **fabric.mod.json:** Onarıldı ✅"
 
-        # Webhook Honeypot Exposed Alert
+        e = mk_jar_embed(
+            title="🧹 JAR Temizleme & Honeypot Başarılı",
+            color=SUCCESS_COLOR,
+            filename=file.filename,
+            elapsed=elapsed,
+            desc_extra=desc_extra,
+            mod_name=jar_meta.get("mod_name", "—"),
+            size_str=f"{orig_kb:.1f} KB → {out_kb:.1f} KB",
+            loader=jar_meta.get("loader", "—"),
+            class_count=jar_meta.get("class_count", "—"),
+            pkg_count=jar_meta.get("pkg_count", "—"),
+            main_class=jar_meta.get("main_class", "N/A"),
+            sha256=file_sha,
+            output_filename=out_fname,
+            uuid_str=full_tid,
+        )
+
         if exposed_webhooks:
             wh_report = []
             for wh in exposed_webhooks:
-                # Saldırgan webhook'unun tamamını asla kanala basma — sadece maskeli ID.
-                # NOT: ID ham URL'den çıkarılmalı (redact sonrası çıkarılamaz).
                 masked_wh = "[redacted-url]"
                 try:
                     m_id = re.search(r"/webhooks/(\d+)/", wh)
@@ -1857,54 +2342,25 @@ async def jarclear(
                 wh_report.append(f"• 🚨 **Saldırgan Webhook:** `{masked_wh}`")
 
             e.add_field(
-                name="🕵️ [LOGGER AVCISI] İfşa Edilen Saldırgan Webhook'ları",
-                value=f"`{len(exposed_webhooks)}` adet zararlı webhook etkisiz hale getirildi.\n" + "\n".join(wh_report) + "\n\n💡 *Bu webhook'lar devre dışı bırakıldı ve tuzak loglayıcımıza yönlendirildi.*",
+                name="🕵️ [LOGGER AVCISI] İfşa Edilen Webhook'lar",
+                value=f"`{len(exposed_webhooks)}` adet zararlı webhook honeypot adresine yönlendirildi.\n" + "\n".join(wh_report),
                 inline=False
             )
 
-            # Send Security Alert to MOD_LOG_CHANNEL
-            if MOD_LOG_CHANNEL and interaction.guild is not None:
-                try:
-                    m_ch = interaction.guild.get_channel(MOD_LOG_CHANNEL)
-                    if m_ch:
-                        log_e = mk_embed("🚨 Tehdit Yakalandı: Discord Webhook Logger",
-                            f"**Kullanıcı:** {interaction.user.mention} ({interaction.user.id})\n"
-                            f"**Dosya:** `{disp_name}`\n"
-                            f"**Yakalanan webhook sayısı:** `{len(exposed_webhooks)}`",
-                            DANGER_COLOR)
-                        await m_ch.send(embed=log_e)
-                except Exception:
-                    pass
-
         clean_log = redact_urls((stdout or "").strip())[-500:] if (stdout or "").strip() else "Temizleme logu yok."
-        e.add_field(name="📋 Temizleme Raporu", value=f"```\n{clean_log}\n```", inline=False)
+        e.add_field(name="📋 Temizleme Detayı", value=f"```\n{clean_log}\n```", inline=False)
 
-        if removed_silents:
-            shown_rs = [f"`{redact_urls(s)[:80]}`" for s in removed_silents[:8]]
-            if len(removed_silents) > 8:
-                shown_rs.append(f"*+{len(removed_silents) - 8} daha…*")
-            e.add_field(name="🗑️ Silinen SilentNet Payload'ları",
-                        value="\n".join(shown_rs)[:1000], inline=False)
-
-        if cleaned_injections:
-            shown_ci = [f"`{redact_urls(s)[:80]}`" for s in cleaned_injections[:8]]
-            if len(cleaned_injections) > 8:
-                shown_ci.append(f"*+{len(cleaned_injections) - 8} hook daha…*")
-            e.add_field(name="💉 Cerrahi Olarak Temizlenen Hooklar",
-                        value="\n".join(shown_ci)[:1000], inline=False)
-
-        if susp_methods:
-            shown_s = [f"`{redact_urls(s)[:80]}`" for s in susp_methods[:10]]
-            if len(susp_methods) > 10:
-                shown_s.append(f"*+{len(susp_methods) - 10} metot daha…*")
-            e.add_field(name="🕵️ Şüpheli Metotlar (Temizlenemedi — Elle İncele)",
-                        value="\n".join(shown_s)[:1000], inline=False)
-
-        dfile = discord.File(out, filename=f"cleaned_{safe_filename(file.filename)}")
-        try:
-            await safe_followup(interaction, embed=e, file=dfile)
-        finally:
-            close_discord_files([dfile])
+        if out.stat().st_size > 24.5 * 1024 * 1024:
+            e.add_field(name="⚠️ Uyarı",
+                        value=f"Temizlenmiş dosya (`{out.stat().st_size / (1024*1024):.1f} MB`) Discord 25MB sınırını aşıyor!",
+                        inline=False)
+            await safe_followup(interaction, embed=e)
+        else:
+            dfile = discord.File(out, filename=out_fname)
+            try:
+                await safe_followup(interaction, embed=e, file=dfile)
+            finally:
+                close_discord_files([dfile])
     except Exception as exc:
         if tracker:
             await tracker.stop()
@@ -1943,7 +2399,8 @@ async def jarprotect(
         return await interaction.response.send_message(f"❌ Dosya çok büyük! Maksimum limit: `{MAX_FILE_SIZE_MB} MB`", ephemeral=True)
 
     await safe_defer(interaction, thinking=True)
-    tid = str(uuid.uuid4())[:8]
+    full_tid = str(uuid.uuid4())
+    tid = full_tid[:8]
     inp = TEMP_DIR / f"{tid}_{safe_filename(file.filename)}"
     out = OUTPUT_DIR / f"{tid}_protected_{safe_filename(file.filename)}"
 
@@ -1954,8 +2411,9 @@ async def jarprotect(
     start_time = time.time()
     try:
         await file.save(inp)
+        file_sha = get_sha256(inp)
+        jar_meta = extract_jar_meta(inp)
 
-        # Calculate epoch expiry (0-3650 gün clamp)
         expiry_epoch = 0
         if expire_days and expire_days > 0:
             expire_days = min(expire_days, 3650)
@@ -1978,25 +2436,52 @@ async def jarprotect(
             log = redact_urls(stdout + stderr)[:1000]
             return await safe_followup(interaction, f"❌ Koruma enjeksiyonu hatası:\n```\n{log}\n```")
 
-        disp_name = safe_filename(file.filename)[:100]
-        e = mk_embed("🛡️ SuS Protector v4.1 — Lisans Kalkanı Enjekte Edildi",
-            f"**`{disp_name}`** başarıyla koruma altına alındı ve lisans kalkanı entegre edildi! (⏱️ `{elapsed}s`)\n\n"
-            "🔒 **Enjekte Edilen Güvenlik Özellikleri:**\n"
-            f"• **HWID / Kullanıcı Kilidi:** `{target_hwid if target_hwid != 'NONE' else 'Devre Dışı'}`\n"
-            f"• **TimeBomb Süre Kilidi:** `{f'{expire_days} Gün Sonra' if expire_days else 'Sınırsız / Yok'}`\n"
-            f"• **Alarm Bildirim Ağı:** `{'Aktif Webhook' if wh_alarm != 'NONE' else 'Bağlanmadı'}`\n"
-            "• **Anti-Tamper & Entrypoint Muhafızı:** Sınıf yüklenişinde yetkisiz çalıştırmayı doğrudan sonlandırır.",
-            0x2ECC71)
+        orig_kb = file.size / 1024
+        out_kb  = out.stat().st_size / 1024
+        out_fname = f"protected_{safe_filename(file.filename)}"
 
-        e.add_field(name="📊 Dosya Bilgileri",
-            value=f"• Orijinal Boyut: `{file.size / 1024:.1f} KB`\n"
-                  f"• Korumalı Boyut: `{out.stat().st_size / 1024:.1f} KB`", inline=True)
+        desc_extra = (
+            f"**HWID Kilidi:** `{target_hwid if target_hwid != 'NONE' else 'Devre Dışı'}` | "
+            f"**Süre:** `{f'{expire_days} Gün' if expire_days else 'Sınırsız'}` | "
+            f"**Alarm Webhook:** `{'Aktif' if wh_alarm != 'NONE' else 'Yok'}`"
+        )
 
-        dfile = discord.File(out, filename=f"protected_{safe_filename(file.filename)}")
-        try:
-            await safe_followup(interaction, embed=e, file=dfile)
-        finally:
-            close_discord_files([dfile])
+        e = mk_jar_embed(
+            title="🛡️ SuS Protector — Lisans Kalkanı Aktif",
+            color=0x2ECC71,
+            filename=file.filename,
+            elapsed=elapsed,
+            desc_extra=desc_extra,
+            mod_name=jar_meta.get("mod_name", "—"),
+            size_str=f"{orig_kb:.1f} KB → {out_kb:.1f} KB",
+            loader=jar_meta.get("loader", "—"),
+            class_count=jar_meta.get("class_count", "—"),
+            pkg_count=jar_meta.get("pkg_count", "—"),
+            main_class=jar_meta.get("main_class", "N/A"),
+            sha256=file_sha,
+            output_filename=out_fname,
+            uuid_str=full_tid,
+        )
+
+        e.add_field(
+            name="🔒 Güvenlik Katmanları",
+            value="• **Anti-Tamper Entrypoint:** Bytecode manipülasyonunda JVM anında kapanır.\n"
+                  "• **Hardware ID Binding:** Yetkisiz makine çalıştırmaları engellenir.\n"
+                  "• **TimeBomb Modülü:** Süre dolduğunda sınıf yükleme reddedilir.",
+            inline=False
+        )
+
+        if out.stat().st_size > 24.5 * 1024 * 1024:
+            e.add_field(name="⚠️ Uyarı",
+                        value=f"Korumalı dosya (`{out.stat().st_size / (1024*1024):.1f} MB`) Discord 25MB sınırını aşıyor!",
+                        inline=False)
+            await safe_followup(interaction, embed=e)
+        else:
+            dfile = discord.File(out, filename=out_fname)
+            try:
+                await safe_followup(interaction, embed=e, file=dfile)
+            finally:
+                close_discord_files([dfile])
     except Exception as exc:
         if tracker:
             await tracker.stop()
@@ -2029,7 +2514,8 @@ async def jardiff(
             return await interaction.response.send_message(msg1, ephemeral=True)
 
     await safe_defer(interaction, thinking=True)
-    tid = str(uuid.uuid4())[:8]
+    full_tid = str(uuid.uuid4())
+    tid = full_tid[:8]
     inp1 = TEMP_DIR / f"{tid}_orig_{safe_filename(original_file.filename)}"
     inp2 = TEMP_DIR / f"{tid}_mod_{safe_filename(modified_file.filename)}"
     rep  = OUTPUT_DIR / f"diff_report_{tid}.txt"
@@ -2042,6 +2528,10 @@ async def jardiff(
     try:
         await original_file.save(inp1)
         await modified_file.save(inp2)
+        sha1 = get_sha256(inp1)
+        sha2 = get_sha256(inp2)
+        meta1 = extract_jar_meta(inp1)
+        meta2 = extract_jar_meta(inp2)
 
         ret, stdout, stderr = await run_engine("diff", inp1, inp2, rep)
         elapsed = round(time.time() - start_time, 2)
@@ -2051,14 +2541,29 @@ async def jardiff(
 
         diff_summary = redact_urls(stdout.strip())[-1000:] if stdout.strip() else "Karşılaştırma tamamlandı."
 
-        e = mk_embed("🔍 SuS Differ — JAR Karşılaştırma Raporu",
-            f"**`{original_file.filename}`** ➔ **`{modified_file.filename}`** (⏱️ `{elapsed}s`)\n\n"
-            f"```\n{diff_summary}\n```", 0x3498DB)
+        orig_kb = original_file.size / 1024
+        mod_kb  = modified_file.size / 1024
+        diff_kb = mod_kb - orig_kb
 
-        e.add_field(name="📊 Boyut Karşılaştırması",
-            value=f"• Orijinal: `{original_file.size / 1024:.1f} KB`\n"
-                  f"• Değiştirilmiş: `{modified_file.size / 1024:.1f} KB`\n"
-                  f"• Fark: `{(modified_file.size - original_file.size) / 1024:+.1f} KB`", inline=True)
+        e = mk_jar_embed(
+            title="🔍 SuS Differ — Bytecode Karşılaştırma Raporu",
+            color=0x3498DB,
+            filename=f"{original_file.filename} vs {modified_file.filename}",
+            elapsed=elapsed,
+            desc_extra=f"**Boyut Değişimi:** `{orig_kb:.1f} KB` → `{mod_kb:.1f} KB` (`{diff_kb:+.1f} KB`)",
+            mod_name=meta1.get("mod_name", "—"),
+            size_str=f"{orig_kb:.1f} KB ➔ {mod_kb:.1f} KB",
+            loader=f"{meta1.get('loader', '—')} / {meta2.get('loader', '—')}",
+            class_count=f"{meta1.get('class_count', '—')} ➔ {meta2.get('class_count', '—')}",
+            pkg_count=f"{meta1.get('pkg_count', '—')} ➔ {meta2.get('pkg_count', '—')}",
+            main_class=meta1.get("main_class", "N/A"),
+            sha256=sha1,
+            output_filename=f"diff_report_{safe_filename(original_file.filename)}.txt",
+            uuid_str=full_tid,
+        )
+
+        e.add_field(name="🔒 Değiştirilen Dosya SHA-256", value=f"`{sha2}`", inline=False)
+        e.add_field(name="📋 Fark Analiz Özeti", value=f"```\n{diff_summary}\n```", inline=False)
 
         if rep.exists():
             dfile = discord.File(rep, filename=f"diff_report_{safe_filename(original_file.filename)}.txt")
@@ -2136,7 +2641,10 @@ async def giveaway(interaction: discord.Interaction, sure: int, odul: str, kazan
     e.set_footer(text=f"Düzenleyen: {interaction.user.display_name} | {FOOTER_TEXT}")
 
     msg = await channel.send(embed=e)
-    await msg.add_reaction("🎉")
+    try:
+        await msg.add_reaction("🎉")
+    except Exception:
+        pass
     await interaction.response.send_message("✅ Çekiliş başlatıldı!", ephemeral=True)
 
     g_data = load_json("giveaways")
@@ -2146,30 +2654,14 @@ async def giveaway(interaction: discord.Interaction, sure: int, odul: str, kazan
     }
     save_json("giveaways", g_data)
 
-    await asyncio.sleep(sure * 60)
-
-    try:
-        msg = await channel.fetch_message(msg.id)
-    except (discord.NotFound, discord.HTTPException):
-        return
-
-    reaction = discord.utils.get(msg.reactions, emoji="🎉")
-    if not reaction:
-        return await channel.send("❌ Çekilişe kimse katılmadı.")
-
-    users = [u async for u in reaction.users() if not u.bot]
-    if not users:
-        return await channel.send("❌ Çekilişe kimse katılmadı.")
-
-    winners  = random.sample(users, min(kazanan, len(users)))
-    wins_str = ", ".join(w.mention for w in winners)
-    e2 = mk_embed("🎊 Çekiliş Sonuçlandı!",
-        f"**Ödül:** {odul}\n**Kazanan(lar):** {wins_str}\n\nTebrikler! 🎉", SUCCESS_COLOR)
-    await channel.send(embed=e2)
-
-    g_data = load_json("giveaways")
-    g_data.pop(str(msg.id), None)
-    save_json("giveaways", g_data)
+    # 2 dakika veya daha kisa cekilisler icin hizli bitirme gorevi (uzunlar background loop tarafindan yonetilir)
+    if sure <= 2:
+        async def _finish_fast():
+            await asyncio.sleep(sure * 60)
+            cur_data = load_json("giveaways")
+            if str(msg.id) in cur_data:
+                await check_active_giveaways()
+        asyncio.create_task(_finish_fast())
 
 # ─── MODERATION ───────────────────────────────
 async def _mod_log(guild: discord.Guild, title: str, desc: str, color: int = DANGER_COLOR):
@@ -3160,7 +3652,34 @@ async def setup_cmd(interaction: discord.Interaction, temizle: bool = True):
                       "• Ses: `➕・Ses Oluştur` kanalina giren kisiye ozel oda acilir\n"
                       "• Ticket acilinca otomatik **ozel ses kanali** da acilir",
                 inline=False)
-    await safe_followup(interaction, embed=e)
+    delivered = False
+    try:
+        await safe_followup(interaction, embed=e)
+        delivered = True
+    except Exception:
+        pass
+
+    if not delivered:
+        report_ch = None
+        chat_id = text_ids.get("💬・chat")
+        if chat_id:
+            report_ch = guild.get_channel(chat_id)
+        if not report_ch and text_ids:
+            first_id = next(iter(text_ids.values()), 0)
+            report_ch = guild.get_channel(first_id)
+
+        if report_ch and isinstance(report_ch, discord.TextChannel):
+            try:
+                await report_ch.send(content=f"👋 {interaction.user.mention}", embed=e)
+                delivered = True
+            except Exception:
+                pass
+
+    if not delivered:
+        try:
+            await interaction.user.send(embed=e)
+        except Exception:
+            pass
 
 
 # ─── TICKET SES KANALI (ticket acilinca ozel ses, kapaninca sil) ───
